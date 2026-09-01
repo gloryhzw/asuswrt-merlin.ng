@@ -13,6 +13,7 @@
 
 #include <linux/init.h>
 #include <linux/kernel.h>
+#include <linux/atomic.h>
 #include <linux/device.h>
 #include <linux/smp.h>
 #include <linux/cpu.h>
@@ -32,6 +33,7 @@
 #include <asm/virt.h>
 
 #include <clocksource/arm_arch_timer.h>
+#include <asm/cputype.h>
 
 #undef pr_fmt
 #define pr_fmt(fmt) "arch_timer: " fmt
@@ -319,6 +321,37 @@ static u64 notrace arm64_858921_read_cntvct_el0(void)
 }
 #endif
 
+static atomic64_t b53_last_cntpct = ATOMIC64_INIT(0);
+static atomic64_t b53_last_cntvct = ATOMIC64_INIT(0);
+
+static u64 notrace b53_read_cntpct_el0(void)
+{
+	u64 raw = read_sysreg(cntpct_el0);
+	u64 prev = (u64)atomic64_read(&b53_last_cntpct);
+	if (raw < prev) return prev;
+	while (raw > prev) {
+		u64 old = (u64)atomic64_cmpxchg(&b53_last_cntpct, (s64)prev, (s64)raw);
+		if (old == prev) break;
+		prev = old;
+		if (raw < prev) return prev;
+	}
+	return raw;
+}
+
+static u64 notrace b53_read_cntvct_el0(void)
+{
+	u64 raw = read_sysreg(cntvct_el0);
+	u64 prev = (u64)atomic64_read(&b53_last_cntvct);
+	if (raw < prev) return prev;
+	while (raw > prev) {
+		u64 old = (u64)atomic64_cmpxchg(&b53_last_cntvct, (s64)prev, (s64)raw);
+		if (old == prev) break;
+		prev = old;
+		if (raw < prev) return prev;
+	}
+	return raw;
+}
+
 #ifdef CONFIG_SUN50I_ERRATUM_UNKNOWN1
 /*
  * The low bits of the counter registers are indeterminate while bit 10 or
@@ -450,6 +483,13 @@ static const struct arch_timer_erratum_workaround ool_workarounds[] = {
 		.read_cntvct_el0 = arm64_858921_read_cntvct_el0,
 	},
 #endif
+	{
+		.match_type = ate_match_local_cap_id,
+		.id = (void *)ARM64_WORKAROUND_B53_TIMER,
+		.desc = "Broadcom B53 Timer Erratum",
+		.read_cntpct_el0 = b53_read_cntpct_el0,
+		.read_cntvct_el0 = b53_read_cntvct_el0,
+	},
 #ifdef CONFIG_SUN50I_ERRATUM_UNKNOWN1
 	{
 		.match_type = ate_match_dt,
@@ -481,7 +521,9 @@ static
 bool arch_timer_check_local_cap_erratum(const struct arch_timer_erratum_workaround *wa,
 					const void *arg)
 {
-	return this_cpu_has_cap((uintptr_t)wa->id);
+	if (this_cpu_has_cap((uintptr_t)wa->id)) return true;
+	if ((uintptr_t)wa->id == ARM64_WORKAROUND_B53_TIMER && (read_cpuid_id() & MIDR_CPU_MODEL_MASK) == MIDR_BRAHMA_B53) return true;
+	return false;
 }
 
 
@@ -864,7 +906,7 @@ static void arch_counter_set_user_access(void)
 	 * need to be workaround. The vdso may have been already
 	 * disabled though.
 	 */
-	if (arch_timer_this_cpu_has_cntvct_wa())
+	if (arch_timer_this_cpu_has_cntvct_wa() || (read_cpuid_id() & MIDR_CPU_MODEL_MASK) == MIDR_BRAHMA_B53)
 		pr_info("CPU%d: Trapping CNTVCT access\n", smp_processor_id());
 	else
 		cntkctl |= ARCH_TIMER_USR_VCT_ACCESS_EN;
