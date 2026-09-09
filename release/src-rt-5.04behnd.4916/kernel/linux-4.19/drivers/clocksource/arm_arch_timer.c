@@ -324,16 +324,25 @@ static u64 notrace arm64_858921_read_cntvct_el0(void)
 static atomic64_t b53_last_cntpct = ATOMIC64_INIT(0);
 static atomic64_t b53_last_cntvct = ATOMIC64_INIT(0);
 
+#define B53_GLITCH_THRESHOLD	0x100000ULL	/* ~1M ticks (~12.5ms @ 80MHz) */
+
 static u64 notrace b53_read_cntpct_el0(void)
 {
 	u64 raw = read_sysreg(cntpct_el0);
 	u64 prev = (u64)atomic64_read(&b53_last_cntpct);
-	if (raw < prev) return prev;
+
+	if (unlikely(raw < prev)) {
+		if (prev - raw < B53_GLITCH_THRESHOLD)
+			return prev;
+		atomic64_set(&b53_last_cntpct, raw);
+		return raw;
+	}
 	while (raw > prev) {
 		u64 old = (u64)atomic64_cmpxchg(&b53_last_cntpct, (s64)prev, (s64)raw);
 		if (old == prev) break;
 		prev = old;
-		if (raw < prev) return prev;
+		if (raw < prev)
+			return (prev - raw < B53_GLITCH_THRESHOLD) ? prev : raw;
 	}
 	return raw;
 }
@@ -342,12 +351,19 @@ static u64 notrace b53_read_cntvct_el0(void)
 {
 	u64 raw = read_sysreg(cntvct_el0);
 	u64 prev = (u64)atomic64_read(&b53_last_cntvct);
-	if (raw < prev) return prev;
+
+	if (unlikely(raw < prev)) {
+		if (prev - raw < B53_GLITCH_THRESHOLD)
+			return prev;
+		atomic64_set(&b53_last_cntvct, raw);
+		return raw;
+	}
 	while (raw > prev) {
 		u64 old = (u64)atomic64_cmpxchg(&b53_last_cntvct, (s64)prev, (s64)raw);
 		if (old == prev) break;
 		prev = old;
-		if (raw < prev) return prev;
+		if (raw < prev)
+			return (prev - raw < B53_GLITCH_THRESHOLD) ? prev : raw;
 	}
 	return raw;
 }
