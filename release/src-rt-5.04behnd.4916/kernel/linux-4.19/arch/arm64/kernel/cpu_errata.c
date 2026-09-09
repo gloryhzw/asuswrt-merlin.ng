@@ -861,6 +861,11 @@ const struct arm64_cpu_capabilities arm64_errata[] = {
 		.capability = ARM64_WORKAROUND_858921,
 		ERRATA_MIDR_ALL_VERSIONS(MIDR_CORTEX_A73),
 	},
+	{
+		.desc = "Broadcom B53 Timer Erratum",
+		.capability = ARM64_WORKAROUND_B53_TIMER,
+		ERRATA_MIDR_ALL_VERSIONS(MIDR_BRAHMA_B53),
+	},
 #endif
 	{
 		.desc = "Branch predictor hardening",
