@@ -106,6 +106,8 @@ unsigned long long notrace sched_clock(void)
 
 		cyc = (rd->read_sched_clock() - rd->epoch_cyc) &
 		      rd->sched_clock_mask;
+		if (unlikely(cyc & ~(rd->sched_clock_mask >> 1)))
+			cyc = 0;
 		res = rd->epoch_ns + cyc_to_ns(cyc, rd->mult, rd->shift);
 	} while (read_seqcount_retry(&cd.seq, seq));
 
@@ -145,11 +147,15 @@ static void update_sched_clock(void)
 	u64 cyc;
 	u64 ns;
 	struct clock_read_data rd;
+	u64 delta;
 
 	rd = cd.read_data[0];
 
 	cyc = cd.actual_read_sched_clock();
-	ns = rd.epoch_ns + cyc_to_ns((cyc - rd.epoch_cyc) & rd.sched_clock_mask, rd.mult, rd.shift);
+	delta = (cyc - rd.epoch_cyc) & rd.sched_clock_mask;
+	if (unlikely(delta & ~(rd.sched_clock_mask >> 1)))
+		delta = 0;
+	ns = rd.epoch_ns + cyc_to_ns(delta, rd.mult, rd.shift);
 
 	rd.epoch_ns = ns;
 	rd.epoch_cyc = cyc;
