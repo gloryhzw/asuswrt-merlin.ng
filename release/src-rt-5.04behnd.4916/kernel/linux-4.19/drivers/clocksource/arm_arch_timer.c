@@ -502,6 +502,8 @@ static const struct arch_timer_erratum_workaround ool_workarounds[] = {
 		.desc = "Broadcom B53 Timer Erratum",
 		.read_cntpct_el0 = b53_read_cntpct_el0,
 		.read_cntvct_el0 = b53_read_cntvct_el0,
+		.set_next_event_phys = erratum_set_next_event_tval_phys,
+		.set_next_event_virt = erratum_set_next_event_tval_virt,
 	},
 #ifdef CONFIG_SUN50I_ERRATUM_UNKNOWN1
 	{
