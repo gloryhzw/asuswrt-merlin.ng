@@ -66,6 +66,12 @@ If software writes to `TVAL` at the exact clock cycle where an internal carry ri
    - Enables `CONFIG_WATCHDOG_PRETIMEOUT_GOV_PANIC=y` so that watchdog pre-timeouts trigger a kernel panic backtrace to preserve crash context in memory and NVRAM rather than silent hardware resets.
    - Enables `CONFIG_PRINTK_TIME=y` and `BCM_PRINTK_TIME=y` for microsecond-precision timestamps.
 
+6. **Watchdog Pretimeout Asymmetric Interrupt Affinity Routing (`/proc/irq/41/smp_affinity`)**:
+   - On Broadcom BCA platforms, CPU 0 bears 100% of the system infrastructure load (switch packet queues `crossbow_rxq/txq`, packet bridge `br0`, memory buffer recycling `bcmsw_recycle`, eMMC flash, and console), while CPUs 1–3 exclusively service PCIe wireless radios.
+   - Under standard ARM GICv2 SPI routing, unpinned hardware interrupts target the lowest core (CPU 0). Consequently, the hardware watchdog pretimeout interrupt (IRQ 41, `ff800480.watchdog`) was routed strictly to CPU 0.
+   - If CPU 0 encounters a hard lockup with local interrupts disabled (`local_irq_disable` / `spin_lock_irqsave`, such as during high-contention Wi-Fi SCB deauthorizations or bridge lock contention), CPU 0 cannot take IRQ 41. This bypassed `watchdog_notify_pretimeout()`, silenced the panic handler, and prevented `mtdoops` from dumping crash logs to `/dev/mtd12` before the ASIC watchdog counter reached zero (`BOOT REASON WATCHDOG 0x3424`).
+   - **Remediation**: Explicitly route IRQ 41 affinity to **CPU 3** (`smp_affinity: 8`) in startup scripts (`init-start` / `services-start`). Since CPU 3 is isolated from CPU 0's Ethernet switch and bridge locking paths, CPU 3 reliably intercepts the pretimeout event at 57 seconds, triggers `panic()`, and preserves the complete `dmesg` buffer and CPU status to flash.
+
 ### 3. Validation Suite: `b53_bench`
 
 A dedicated bare-metal C test suite ([`b53_bench.c`](https://github.com/gloryhzw/asuswrt-merlin.ng/releases/download/0.99/b53_bench.c)) was authored to validate Brahma-B53 timer monotonicity, cross-core skew, and TVAL bypass stability under live SMP loads.
@@ -93,7 +99,8 @@ chmod +x /tmp/b53_bench
 
 ### 4. Verification & Live Operational Results
 
-- **Uptime Verification**: Confirmed continuous uptime exceeding **16 continuous days (almost 384 hours, 1,381,758 seconds)** on the **Asus RT-BE92U** under heavy live home routing traffic with zero clock regressions, zero lock contention, and zero rollover deadlocks.
+- **Long-term Monotonicity & Roll-over**: Validated continuous operation exceeding **16 continuous days (almost 384 hours, 1,381,758 seconds)** on the **Asus RT-BE92U** under heavy live home routing traffic with zero clock regressions, zero lock contention, and zero rollover deadlocks.
+- **Kernel #14 Live Operation**: Ran **3.26 days (78.7 hours / 282,319 seconds)** of uninterrupted continuous uptime with TVAL silicon bypass active.
 - **Synthetic Stress Results (Kernel #14)**:
   - Over **14.8 million** cross-core syscall checks at **4.96 Mops**: **0 underflows**, max skew bounded to 0.325 µs.
   - Over **29,000** rapid timer reprogrammings across all 4 cores: **0 missed timer interrupts**, **0 delayed wakeups**, **0 premature firings**.
