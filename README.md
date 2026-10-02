@@ -69,8 +69,18 @@ If software writes to `TVAL` at the exact clock cycle where an internal carry ri
 6. **Watchdog Pretimeout Asymmetric Interrupt Affinity Routing (`/proc/irq/41/smp_affinity`)**:
    - On Broadcom BCA platforms, CPU 0 bears 100% of the system infrastructure load (switch packet queues `crossbow_rxq/txq`, packet bridge `br0`, memory buffer recycling `bcmsw_recycle`, eMMC flash, and console), while CPUs 1–3 exclusively service PCIe wireless radios.
    - Under standard ARM GICv2 SPI routing, unpinned hardware interrupts target the lowest core (CPU 0). Consequently, the hardware watchdog pretimeout interrupt (IRQ 41, `ff800480.watchdog`) was routed strictly to CPU 0.
-   - If CPU 0 encounters a hard lockup with local interrupts disabled (`local_irq_disable` / `spin_lock_irqsave`, such as during high-contention Wi-Fi SCB deauthorizations or bridge lock contention), CPU 0 cannot take IRQ 41. This bypassed `watchdog_notify_pretimeout()`, silenced the panic handler, and prevented `mtdoops` from dumping crash logs to `/dev/mtd12` before the ASIC watchdog counter reached zero (`BOOT REASON WATCHDOG 0x3424`).
+   - If CPU 0 encounters a hard lockup with local interrupts disabled (`local_irq_disable` / `spin_lock_irqsave`), CPU 0 cannot take IRQ 41. This bypassed `watchdog_notify_pretimeout()`, silenced the panic handler, and prevented `mtdoops` from dumping crash logs to `/dev/mtd12` before the ASIC watchdog counter reached zero (`BOOT REASON WATCHDOG 0x3424`).
    - **Remediation**: Explicitly route IRQ 41 affinity to **CPU 3** (`smp_affinity: 8`) in startup scripts (`init-start` / `services-start`). Since CPU 3 is isolated from CPU 0's Ethernet switch and bridge locking paths, CPU 3 reliably intercepts the pretimeout event at 57 seconds, triggers `panic()`, and preserves the complete `dmesg` buffer and CPU status to flash.
+
+7. **Scheduler Real-Time (RT) Throttling Disablement & Watchdog Priority Normalization**:
+   - **Forensic Diagnosis of CPU 0 Lockup**:
+     - *RCU Grace-Period Starvation*: Kernel crash dumps showed `rcu: rcu_sched kthread starved for 15023 jiffies! ... ->state=0x402 ->cpu=0`, proving CPU 0 was trapped inside kernel execution without scheduling (`cond_resched()`) or with preemption/interrupts disabled for over 15 seconds.
+     - *Real-Time Network Thread Congestion*: Broadcom's Ethernet switch recycle thread (`bcmsw_recycle`, PID 535) is pinned to CPU 0 at `SCHED_FIFO 75`. Under high packet recycling and buffer management, it executes inside `spin_lock_irqsave(&crossbow_enet_g.rx_lock, flags)`.
+     - *RT Bandwidth Throttling*: The default kernel parameter `/proc/sys/kernel/sched_rt_runtime_us = 950000` tripped `sched: RT throttling activated`. Because the watchdog daemon (`wdtd`) was configured by default as real-time `SCHED_FIFO 98`, the RT throttle group suspended all RT tasks on the core, preventing `wdtd` from kicking `/dev/watchdog` within the 60-second window.
+     - *The `-30` (`BCME_NOTFOUND`) Red Herring*: Earlier casual inspection of crash logs suggested `WLC_SCB_DEAUTHORIZE error (-30)` triggered the reboot. Rigorous kernel timestamp analysis proved this was a correlation fallacy: `-30` occurred >68 minutes (4,079 seconds) prior to the panic. It is an innocuous Broadcom wireless SDK status (`#define BCME_NOTFOUND -30`) indicating that a departing station's Station Control Block had already aged out.
+   - **Remediation**:
+     - Set `/proc/sys/kernel/sched_rt_runtime_us` to `-1` (disabling RT throttling entirely).
+     - Re-normalized `wdtd` / `wdtctl` scheduling policy from `SCHED_FIFO 98` to `SCHED_OTHER` with maximum non-RT priority (`nice -20`). This completely decouples watchdog petting from the real-time throttle group while guaranteeing high scheduling priority without starving system threads.
 
 ### 3. Validation Suite: `b53_bench`
 
