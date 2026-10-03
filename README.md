@@ -66,11 +66,12 @@ If software writes to `TVAL` at the exact clock cycle where an internal carry ri
    - Enables `CONFIG_WATCHDOG_PRETIMEOUT_GOV_PANIC=y` so that watchdog pre-timeouts trigger a kernel panic backtrace to preserve crash context in memory and NVRAM rather than silent hardware resets.
    - Enables `CONFIG_PRINTK_TIME=y` and `BCM_PRINTK_TIME=y` for microsecond-precision timestamps.
 
-6. **Watchdog Pretimeout Asymmetric Interrupt Affinity Routing (`/proc/irq/41/smp_affinity`)**:
+6. **Watchdog Pretimeout Multi-Core Interrupt Affinity Routing (`/proc/irq/41/smp_affinity`)**:
    - On Broadcom BCA platforms, CPU 0 bears 100% of the system infrastructure load (switch packet queues `crossbow_rxq/txq`, packet bridge `br0`, memory buffer recycling `bcmsw_recycle`, eMMC flash, and console), while CPUs 1–3 exclusively service PCIe wireless radios.
    - Under standard ARM GICv2 SPI routing, unpinned hardware interrupts target the lowest core (CPU 0). Consequently, the hardware watchdog pretimeout interrupt (IRQ 41, `ff800480.watchdog`) was routed strictly to CPU 0.
    - If CPU 0 encounters a hard lockup with local interrupts disabled (`local_irq_disable` / `spin_lock_irqsave`), CPU 0 cannot take IRQ 41. This bypassed `watchdog_notify_pretimeout()`, silenced the panic handler, and prevented `mtdoops` from dumping crash logs to `/dev/mtd12` before the ASIC watchdog counter reached zero (`BOOT REASON WATCHDOG 0x3424`).
-   - **Remediation**: Explicitly route IRQ 41 affinity to **CPU 3** (`smp_affinity: 8`) in startup scripts (`init-start` / `services-start`). Since CPU 3 is isolated from CPU 0's Ethernet switch and bridge locking paths, CPU 3 reliably intercepts the pretimeout event at 57 seconds, triggers `panic()`, and preserves the complete `dmesg` buffer and CPU status to flash.
+   - While routing strictly to CPU 3 was initially trialed, CPU 3 is heavily loaded by 6GHz Wi-Fi (`wl2`, >400k IRQs) and Broadcom IPC sockets (`crossbow_socket`, >450k IRQs), making it susceptible to cross-core `spin_lock_irqsave` lock contention when communicating with CPU 0.
+   - **Remediation**: Explicitly route IRQ 41 affinity to all non-CPU0 cores (**CPUs 1–3**, `smp_affinity: e`) in startup scripts (`init-start` / `services-start`). Under GICv2 1-of-N SPI distribution, if CPU 0 or CPU 3 is trapped in a spinlock with interrupts disabled, any surviving core (CPU 1 or CPU 2) immediately intercepts the pretimeout event at 57 seconds, triggers `panic()`, and preserves the complete `dmesg` buffer and CPU status to flash.
 
 7. **Scheduler Real-Time (RT) Throttling Disablement & Watchdog Priority Normalization**:
    - **Forensic Diagnosis of CPU 0 Lockup**:
