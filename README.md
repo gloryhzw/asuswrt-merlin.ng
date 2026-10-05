@@ -59,7 +59,7 @@ If software writes to `TVAL` at the exact clock cycle where an internal carry ri
    - Hooks `.set_next_event_phys` and `.set_next_event_virt` to bespoke erratum handlers `erratum_set_next_event_tval_phys/virt`.
    - Bypasses the CPU silicon's buggy un-filtered hardware adder entirely: software calculates:
      $$\text{CVAL} = \text{Filtered\_Counter} + \text{evt}$$
-     using the consecutive-read verification filter and writes directly to `cntp_cval_el0`, completely immunizing the system against missed timer interrupts caused by carry ripple during timer programming.
+     using the Spike-Rejection Verified Counter Filter and writes directly to `cntp_cval_el0`, completely immunizing the system against missed timer interrupts caused by carry ripple during timer programming.
 
 5. **Watchdog Panic Governor & Microsecond Logging (`config_base.6a.6765`)**:
    - Enables `CONFIG_WATCHDOG_PRETIMEOUT_GOV_PANIC=y` so that watchdog pre-timeouts trigger a kernel panic backtrace to preserve crash context in memory and NVRAM rather than silent hardware resets.
@@ -119,7 +119,7 @@ chmod +x /tmp/b53_bench
   - Combines per-CPU local monotonic clamping (`B53_RIPPLE_DROP_THRESHOLD = 12.5ms`) with forward carry spike verification (`B53_SPIKE_VERIFY_THRESHOLD = 1ms`).
   - Clamps all physical ripple drops for 100% strict monotonicity, while instantly catching and discarding forward carry spikes (like bit 32 = +53.68s) via pipeline-flushed secondary confirmation, completely preventing `cval` timer poisoning.
   - **Live Verification on Asus RT-BE92U (`b53_timer_test` RAW mode)**:
-    - Over **185.5 million** direct reads across 4 cores: **0 glitches (0.00000%)** -> **100% PASS**!
+    - Over **186.3 million** direct reads across 4 cores: **0 glitches (0.00000%)** -> **100% PASS**!
   - **Live Verification on Asus RT-BE92U (`b53_bench -a 3`)**:
     - Over **13.6 million** inter-core reads: **0 underflows**, max core skew bounded to 0.625 µs.
     - Over **13.7 million** cross-core syscall checks at **4.57 Mops**: **0 underflow crashes**, bounded to < 2 µs.
