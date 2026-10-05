@@ -350,13 +350,25 @@ static u64 notrace arm64_858921_read_cntvct_el0(void)
 #define B53_PAIR_WINDOW		1024ULL		/* 12.8us @ 80MHz */
 #define B53_PAIR_RETRIES	8
 #define B53_HIST_BUCKETS	18		/* fls64(1 .. 79999) = 1 .. 17 */
+#define B53_LARGE_CLAMP		1024ULL		/* ring buffer split: 12.8us */
+#define B53_RING_SIZE		8
+
+/* First read of a clamp episode: before -> last (held) -> raw. */
+struct b53_sample {
+	u64 before;			/* value accepted before 'last' */
+	u64 last;			/* value being held */
+	u64 raw;			/* read that was behind 'last' */
+};
 
 struct b53_timer_state {
 	u64 last[2];			/* [0] = cntpct, [1] = cntvct */
+	u64 before[2];			/* value accepted before last[] */
 	unsigned long clamped;		/* reads held at last (small backward step) */
 	unsigned long episodes;		/* runs of consecutive clamped reads */
 	unsigned long clamp_hist[B53_HIST_BUCKETS]; /* by fls64(last - raw) */
 	bool holding;			/* previous read on this CPU was clamped */
+	struct b53_sample ring[2][B53_RING_SIZE]; /* [0] small, [1] large */
+	unsigned int ring_head[2];
 	unsigned long checked;		/* large step re-read as a pair */
 	unsigned long rejected;		/* first read was >= 1ms off the pair */
 	unsigned long resynced;		/* pair >= 1ms behind last: last was bad */
@@ -365,11 +377,21 @@ struct b53_timer_state {
 
 static DEFINE_PER_CPU(struct b53_timer_state, b53_timer_state);
 
-static __always_inline u64 b53_clamp(struct b53_timer_state *st, u64 prev, u64 behind)
+static __always_inline u64 b53_clamp(struct b53_timer_state *st, bool virt,
+				     u64 prev, u64 raw)
 {
+	u64 behind = prev - raw;
+
 	st->clamped++;
 	st->clamp_hist[fls64(behind)]++;
 	if (!st->holding) {
+		int large = behind >= B53_LARGE_CLAMP;
+		struct b53_sample *smp;
+
+		smp = &st->ring[large][st->ring_head[large]++ % B53_RING_SIZE];
+		smp->before = st->before[virt];
+		smp->last = prev;
+		smp->raw = raw;
 		st->holding = true;
 		st->episodes++;
 	}
@@ -416,7 +438,7 @@ static __always_inline u64 b53_read_counter(bool virt)
 	}
 
 	if (d < 0 && -d < B53_CLAMP_WINDOW)
-		return b53_clamp(st, prev, -d);
+		return b53_clamp(st, virt, prev, raw);
 
 	st->checked++;
 	cur = b53_read_pair(virt, st);
@@ -426,11 +448,12 @@ static __always_inline u64 b53_read_counter(bool virt)
 	d = cur - prev;
 	if (d < 0) {
 		if (-d < B53_CLAMP_WINDOW)
-			return b53_clamp(st, prev, -d);
+			return b53_clamp(st, virt, prev, cur);
 		st->resynced++;
 	}
 accept:
 	st->holding = false;
+	st->before[virt] = prev;
 	st->last[virt] = cur;
 	return cur;
 }
@@ -464,16 +487,35 @@ static int b53_timer_proc_show(struct seq_file *m, void *v)
 		seq_printf(m, "       cpu%d", cpu);
 	seq_putc(m, '\n');
 	for (i = 1; i < B53_HIST_BUCKETS; i++) {
-		unsigned long sum = 0;
+		unsigned long hi = min((1UL << i) - 1, (unsigned long)B53_CLAMP_WINDOW - 1);
 
-		for_each_online_cpu(cpu)
-			sum += per_cpu_ptr(&b53_timer_state, cpu)->clamp_hist[i];
-		if (!sum)
-			continue;
-		seq_printf(m, "%6lu-%-7lu", 1UL << (i - 1), (1UL << i) - 1);
+		seq_printf(m, "%6lu-%-7lu", 1UL << (i - 1), hi);
 		for_each_online_cpu(cpu)
 			seq_printf(m, " %10lu", per_cpu_ptr(&b53_timer_state, cpu)->clamp_hist[i]);
 		seq_putc(m, '\n');
+	}
+
+	seq_puts(m, "\nclamp episodes, first read (before -> last held -> raw), newest last\n");
+	seq_puts(m, "cpu  size  before          last            raw             last-before  raw-before  last^raw\n");
+	for_each_online_cpu(cpu) {
+		struct b53_timer_state *st = per_cpu_ptr(&b53_timer_state, cpu);
+		int large;
+
+		for (large = 1; large >= 0; large--) {
+			unsigned int head = st->ring_head[large];
+			unsigned int n = min(head, (unsigned int)B53_RING_SIZE);
+
+			for (i = n; i > 0; i--) {
+				struct b53_sample *smp = &st->ring[large][(head - i) % B53_RING_SIZE];
+
+				seq_printf(m, "%3d  %-5s %-15llx %-15llx %-15llx %11lld %11lld  %llx\n",
+					   cpu, large ? "large" : "small",
+					   smp->before, smp->last, smp->raw,
+					   (s64)(smp->last - smp->before),
+					   (s64)(smp->raw - smp->before),
+					   smp->last ^ smp->raw);
+			}
+		}
 	}
 	return 0;
 }
@@ -495,6 +537,7 @@ static ssize_t b53_timer_proc_write(struct file *file, const char __user *buf,
 		st->clamped = st->episodes = st->checked = 0;
 		st->rejected = st->resynced = st->unstable = 0;
 		memset(st->clamp_hist, 0, sizeof(st->clamp_hist));
+		st->ring_head[0] = st->ring_head[1] = 0;
 	}
 	return count;
 }
