@@ -29,6 +29,12 @@
 #include <linux/acpi.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
+#include <linux/delay.h>
+#include <linux/irq_work.h>
+#include <linux/math64.h>
+#include <linux/seqlock.h>
+#include <linux/uaccess.h>
+#include <bcm_ext_timer.h>
 
 #include <asm/arch_timer.h>
 #include <asm/virt.h>
@@ -323,27 +329,42 @@ static u64 notrace arm64_858921_read_cntvct_el0(void)
 #endif
 
 /*
- * Broadcom Brahma-B53 counter read erratum workaround.
+ * Broadcom Brahma-B53 counter erratum workaround.
  *
- * Reads of the 80MHz system counter (cntpct_el0 / cntvct_el0) occasionally
- * return a value behind the previous read. Measured on RT-BE92U: mostly
- * 1-127 ticks (< 1.6us), with a second group at 2048-16383 ticks
- * (25-205us) under heavy read load. All CPUs see the same events at the
- * same rate, so it is the shared counter itself.
+ * The counter value the CPUs see (cntpct_el0 / cntvct_el0) is shared by
+ * all cores and is occasionally wrong after a carry: some of the carried
+ * bits are old, so it reads low (or, rarely, high) and keeps counting at
+ * the normal rate with that offset, until the stale bits catch up. Measured
+ * on RT-BE92U: mostly 1-127 ticks for ~18us; up to ~15,500 ticks (194us);
+ * one +2,026; one momentary error >= 1ms. Higher-bit carries may produce
+ * much larger, longer offsets, which would freeze time and stall every
+ * timer interrupt (the hardware comparator uses the same counter).
  *
- * Each CPU remembers the last value it handed out:
+ * Reads: each CPU remembers the last value it handed out.
+ * 1. Forward step < 1ms: accept.
+ * 2. Backward step < 1ms: hold the last value (the clock pauses briefly).
+ * 3. Larger step either way: re-read until two back-to-back reads agree
+ *    (drops momentary glitches), then check the elapsed time against an
+ *    independent Broadcom peripheral timer. If they disagree, the counter
+ *    view is offset: b53_comp (added to every read) is corrected so time
+ *    keeps flowing. Before the reference is available (early boot), a
+ *    confirmed backward step is compensated by its own size instead.
  *
- * 1. Forward step < B53_FAST_WINDOW: normal case, accept.
- * 2. Backward step < B53_CLAMP_WINDOW: read glitch, return the last value
- *    again (the clock holds for a few ticks instead of going backwards).
- * 3. Anything larger, either direction (first read on a CPU, wake from idle,
- *    or a large glitch): only trust a value that two back-to-back reads
- *    agree on, so a single bad read can never be returned, stored as 'last',
- *    or used to program cval. A confirmed value far behind 'last' means
- *    'last' itself was bad, so resync to it instead of holding forever.
+ * Heartbeat: a second peripheral timer interrupts every 10ms, independent
+ * of the arch counter, so an offset that starts while every CPU is idle
+ * (nobody reading, every timer late) is still caught. It also refreshes
+ * the arch/ref anchor and the ref rate. New offsets need two heartbeats
+ * in a row (offsets shorter than ~10ms are left to the hold in step 2);
+ * offsets that end are undone at once.
  *
- * Per-CPU counts of each path, and a log2 histogram of clamp sizes, are
- * reported in /proc/b53_timer. Writing anything to it resets the counters.
+ * Timers: the comparator compares cval against the raw (offset) view, so
+ * cval = filtered time - b53_comp + delta. Whenever b53_comp changes, every
+ * CPU re-programs its next event through irq_work.
+ *
+ * /proc/b53_timer shows per-CPU counts, a clamp-size histogram, clamp
+ * episode samples and the compensation state. Writing to it resets the
+ * statistics; writing "inject <ticks>" fakes a counter view offset for
+ * testing (reads and every CPU's comparator see it, like the real fault).
  */
 #define B53_FAST_WINDOW		80000ULL	/* 1ms @ 80MHz */
 #define B53_CLAMP_WINDOW	80000ULL	/* 1ms @ 80MHz */
@@ -352,6 +373,12 @@ static u64 notrace arm64_858921_read_cntvct_el0(void)
 #define B53_HIST_BUCKETS	18		/* fls64(1 .. 79999) = 1 .. 17 */
 #define B53_LARGE_CLAMP		1024ULL		/* ring buffer split: 12.8us */
 #define B53_RING_SIZE		8
+#define B53_REF_TOL		2000LL		/* 25us: ref read stalls (<= 10us) + slack */
+#define B53_HB_PERIOD_US	10000UL		/* heartbeat: 10ms */
+#define B53_REF_PERIOD_US	(0x3FFFFFFFFFFFFFFFULL / 200)	/* never wraps */
+#define B53_REF_CNT_PHYS	0xff800420UL	/* TimerCnt0; TimerCntN at +8*N */
+#define B53_REF_CNT_MASK	0x3FFFFFFFFFFFFFFFULL
+#define B53_FIX_RING		16
 
 /* First read of a clamp episode: before -> last (held) -> raw. */
 struct b53_sample {
@@ -373,9 +400,37 @@ struct b53_timer_state {
 	unsigned long rejected;		/* first read was >= 1ms off the pair */
 	unsigned long resynced;		/* pair >= 1ms behind last: last was bad */
 	unsigned long unstable;		/* no agreeing pair within retries */
+	unsigned long ref_checked;	/* large step checked against the ref */
 };
 
 static DEFINE_PER_CPU(struct b53_timer_state, b53_timer_state);
+
+/* Offset compensation, shared by all CPUs (the fault is in the shared view). */
+static s64 b53_comp;			/* added to every raw read, arch ticks */
+static bool b53_ref_ready;
+static void __iomem *b53_ref_cnt;
+static int b53_ref_timer = -1, b53_hb_timer = -1;
+static u32 b53_ref_mul;			/* arch ticks per ref tick, Q32 */
+static seqcount_t b53_anchor_seq;
+static u64 b53_anchor_arch, b53_anchor_ref;	/* true arch time <-> ref */
+static bool b53_rearm_pending;
+static DEFINE_PER_CPU(struct irq_work, b53_rearm_work);
+
+/* A correction of b53_comp: raw view, compensation before, error, source. */
+struct b53_fix {
+	u64 raw;
+	s64 comp;
+	s64 err;
+	char src;			/* 'r' read path, 'h' heartbeat, 'b' boot */
+};
+static struct b53_fix b53_fixes[B53_FIX_RING];
+static unsigned int b53_fix_head;
+static unsigned long b53_hb_beats, b53_rearms;
+
+/* Test only: fake view offset, applied to reads and to the comparators. */
+static s64 b53_inject;
+static s64 b53_inject_shift;
+static DEFINE_PER_CPU(struct irq_work, b53_inject_work);
 
 static __always_inline u64 b53_clamp(struct b53_timer_state *st, bool virt,
 				     u64 prev, u64 raw)
@@ -400,11 +455,12 @@ static __always_inline u64 b53_clamp(struct b53_timer_state *st, bool virt,
 
 static __always_inline u64 b53_read_raw(bool virt)
 {
-	return virt ? read_sysreg(cntvct_el0) : read_sysreg(cntpct_el0);
+	return (virt ? read_sysreg(cntvct_el0) : read_sysreg(cntpct_el0)) +
+	       READ_ONCE(b53_inject);
 }
 
 /* Read until two back-to-back reads are in order and within B53_PAIR_WINDOW. */
-static __always_inline u64 b53_read_pair(bool virt, struct b53_timer_state *st)
+static __always_inline u64 b53_read_pair(bool virt, unsigned long *unstable)
 {
 	u64 a, b;
 	int i;
@@ -419,16 +475,54 @@ static __always_inline u64 b53_read_pair(bool virt, struct b53_timer_state *st)
 			return b;
 		a = b;
 	}
-	st->unstable++;
+	(*unstable)++;
 	return b;
+}
+
+static __always_inline u64 b53_ref_read(void)
+{
+	return readq_relaxed(b53_ref_cnt) & B53_REF_CNT_MASK;
+}
+
+/* True arch time now, according to the reference timer; *age = ref ticks
+ * since the anchor (the tolerance grows with it). */
+static __always_inline u64 b53_ref_expect(u64 *age)
+{
+	unsigned int seq;
+	u64 a0, r0, r;
+
+	do {
+		seq = raw_read_seqcount_begin(&b53_anchor_seq);
+		a0 = b53_anchor_arch;
+		r0 = b53_anchor_ref;
+	} while (read_seqcount_retry(&b53_anchor_seq, seq));
+	r = b53_ref_read();
+	*age = r - r0;
+	return a0 + mul_u64_u32_shr(r - r0, b53_ref_mul, 32);
+}
+
+/* Change b53_comp by delta unless another CPU already changed it. */
+static __always_inline void b53_comp_fix(s64 old, s64 delta, u64 raw, char src)
+{
+	struct b53_fix *f;
+
+	if (cmpxchg64(&b53_comp, old, old + delta) != old)
+		return;
+	f = &b53_fixes[b53_fix_head++ % B53_FIX_RING];
+	f->raw = raw;
+	f->comp = old;
+	f->err = -delta;
+	f->src = src;
+	WRITE_ONCE(b53_rearm_pending, true);
 }
 
 /* Called with preemption disabled (arch_timer_reg_read_stable). */
 static __always_inline u64 b53_read_counter(bool virt)
 {
 	struct b53_timer_state *st = raw_cpu_ptr(&b53_timer_state);
+	s64 comp = READ_ONCE(b53_comp);
 	u64 prev = st->last[virt];
-	u64 raw = b53_read_raw(virt);
+	u64 raw = b53_read_raw(virt) + comp;
 	s64 d = raw - prev;
 	u64 cur;
 
@@ -441,15 +535,39 @@ static __always_inline u64 b53_read_counter(bool virt)
 		return b53_clamp(st, virt, prev, raw);
 
 	st->checked++;
-	cur = b53_read_pair(virt, st);
+	cur = b53_read_pair(virt, &st->unstable) + comp;
 	if (abs((s64)(raw - cur)) >= B53_CLAMP_WINDOW)
 		st->rejected++;
+
+	if (READ_ONCE(b53_ref_ready)) {
+		u64 age, expect = b53_ref_expect(&age);
+		s64 err = cur - expect;
+
+		st->ref_checked++;
+		if (abs(err) > B53_REF_TOL + (s64)(age >> 12)) {
+			/* the counter view is offset by err: take it back out */
+			b53_comp_fix(comp, -err, cur - comp, 'r');
+			cur -= err;
+		}
+	}
 
 	d = cur - prev;
 	if (d < 0) {
 		if (-d < B53_CLAMP_WINDOW)
 			return b53_clamp(st, virt, prev, cur);
-		st->resynced++;
+		if (!READ_ONCE(b53_ref_ready)) {
+			/* no reference yet: trust 'last', compensate the drop */
+			b53_comp_fix(comp, -d, cur - comp, 'b');
+			cur = prev;
+		} else {
+			st->resynced++;		/* the ref says 'last' was wrong */
+		}
+	} else if (!READ_ONCE(b53_ref_ready) && comp > 0 &&
+		   abs(d - comp) < (s64)B53_CLAMP_WINDOW) {
+		/* no reference yet: a forward step the size of the
+		 * compensation means the offset ended */
+		b53_comp_fix(comp, -comp, cur - comp, 'b');
+		cur -= comp;
 	}
 accept:
 	st->holding = false;
@@ -468,17 +586,170 @@ static u64 notrace b53_read_cntvct_el0(void)
 	return b53_read_counter(true);
 }
 
+/*
+ * The comparator fires when the raw (offset) view reaches cval, so program
+ * cval in raw terms: filtered time - b53_comp + delta.
+ */
+static __always_inline void b53_set_next_event(const int access, unsigned long evt,
+					       struct clock_event_device *clk)
+{
+	unsigned long ctrl;
+	u64 cval;
+
+	ctrl = arch_timer_reg_read(access, ARCH_TIMER_REG_CTRL, clk);
+	ctrl |= ARCH_TIMER_CTRL_ENABLE;
+	ctrl &= ~ARCH_TIMER_CTRL_IT_MASK;
+
+	/* the hardware compares against the real counter: take any test
+	 * injection back out of the view-based value */
+	if (access == ARCH_TIMER_PHYS_ACCESS) {
+		cval = arch_counter_get_cntpct() - READ_ONCE(b53_comp) + evt;
+		write_sysreg(cval - READ_ONCE(b53_inject), cntp_cval_el0);
+	} else {
+		cval = arch_counter_get_cntvct() - READ_ONCE(b53_comp) + evt;
+		write_sysreg(cval - READ_ONCE(b53_inject), cntv_cval_el0);
+	}
+
+	arch_timer_reg_write(access, ARCH_TIMER_REG_CTRL, ctrl, clk);
+}
+
+static int b53_set_next_event_phys(unsigned long evt, struct clock_event_device *clk)
+{
+	b53_set_next_event(ARCH_TIMER_PHYS_ACCESS, evt, clk);
+	return 0;
+}
+
+static int b53_set_next_event_virt(unsigned long evt, struct clock_event_device *clk)
+{
+	b53_set_next_event(ARCH_TIMER_VIRT_ACCESS, evt, clk);
+	return 0;
+}
+
+/* irq_work on each CPU after b53_comp changed: re-program the next event. */
+static void b53_rearm_fn(struct irq_work *work)
+{
+	struct clock_event_device *evt = this_cpu_ptr(arch_timer_evt);
+	s64 delta;
+	u64 cycles;
+
+	if (!evt || !clockevent_state_oneshot(evt) || evt->next_event == KTIME_MAX)
+		return;
+	delta = ktime_to_ns(ktime_sub(evt->next_event, ktime_get()));
+	delta = clamp_t(s64, delta, (s64)evt->min_delta_ns, (s64)evt->max_delta_ns);
+	cycles = ((u64)delta * evt->mult) >> evt->shift;
+	evt->set_next_event((unsigned long)cycles, evt);
+}
+
+/* Test only: shift this CPU's armed comparator as a real view jump would. */
+static void b53_inject_fn(struct irq_work *work)
+{
+	write_sysreg(read_sysreg(cntp_cval_el0) - READ_ONCE(b53_inject_shift),
+		     cntp_cval_el0);
+	write_sysreg(read_sysreg(cntv_cval_el0) - READ_ONCE(b53_inject_shift),
+		     cntv_cval_el0);
+	isb();
+}
+
+static void b53_rearm_all(void)
+{
+	int cpu;
+
+	WRITE_ONCE(b53_rearm_pending, false);
+	b53_rearms++;
+	for_each_online_cpu(cpu)
+		irq_work_queue_on(per_cpu_ptr(&b53_rearm_work, cpu), cpu);
+}
+
+/*
+ * Heartbeat (hard IRQ, every 10ms, on whichever CPU takes the peripheral
+ * timer interrupt). Compares the arch counter with the reference.
+ */
+static void b53_heartbeat(unsigned long unused)
+{
+	static s64 pending_err;
+	static u64 cal_arch, cal_ref;
+	static bool cal_dirty;
+	unsigned long unstable = 0;
+	s64 comp, err;
+	u64 raw, cur, r, age, expect, now;
+
+	if (!READ_ONCE(b53_ref_ready))
+		return;
+	b53_hb_beats++;
+	comp = READ_ONCE(b53_comp);
+	raw = b53_read_pair(false, &unstable);
+	cur = raw + comp;
+	expect = b53_ref_expect(&age);
+	r = b53_anchor_ref + age;
+	err = cur - expect;
+	now = cur;
+
+	if (abs(err) > B53_REF_TOL) {
+		bool ending = abs(comp - err) < abs(comp);
+
+		if (ending || (pending_err && abs(err - pending_err) < B53_REF_TOL)) {
+			b53_comp_fix(comp, -err, raw, 'h');
+			now = expect;
+			pending_err = 0;
+			cal_dirty = true;
+		} else {
+			pending_err = err;	/* confirm on the next beat */
+			now = expect;
+		}
+	} else {
+		pending_err = 0;
+	}
+
+	write_seqcount_begin(&b53_anchor_seq);
+	b53_anchor_arch = now;
+	b53_anchor_ref = r;
+	write_seqcount_end(&b53_anchor_seq);
+
+	if (READ_ONCE(b53_rearm_pending))
+		b53_rearm_all();
+
+	/* refine the ref rate every ~1s (the clocks differ and wander) */
+	if (r - cal_ref >= 200000000ULL) {
+		if (cal_ref && !cal_dirty) {
+			u64 mul = div64_u64((now - cal_arch) << 32, r - cal_ref);
+
+			b53_ref_mul = b53_ref_mul - (b53_ref_mul >> 3) + (u32)(mul >> 3);
+		}
+		cal_arch = now;
+		cal_ref = r;
+		cal_dirty = false;
+	}
+}
+
 static int b53_timer_proc_show(struct seq_file *m, void *v)
 {
 	int cpu, i;
+	unsigned int n;
 
-	seq_puts(m, "cpu    clamped   episodes    checked   rejected   resynced   unstable\n");
+	seq_puts(m, "cpu    clamped   episodes    checked   rejected   resynced   unstable  refchecks\n");
 	for_each_online_cpu(cpu) {
 		struct b53_timer_state *st = per_cpu_ptr(&b53_timer_state, cpu);
 
-		seq_printf(m, "%3d %10lu %10lu %10lu %10lu %10lu %10lu\n", cpu,
+		seq_printf(m, "%3d %10lu %10lu %10lu %10lu %10lu %10lu %10lu\n", cpu,
 			   st->clamped, st->episodes, st->checked, st->rejected,
-			   st->resynced, st->unstable);
+			   st->resynced, st->unstable, st->ref_checked);
+	}
+
+	seq_printf(m, "\ninjected (test): %lld ticks\n", READ_ONCE(b53_inject));
+	seq_printf(m, "compensation: %lld ticks  ref: %s (timer %d, heartbeat timer %d, %lu beats)  rate: %lld ppm vs 2.5  rearms: %lu  fixes: %u\n",
+		   READ_ONCE(b53_comp), b53_ref_ready ? "on" : "off",
+		   b53_ref_timer, b53_hb_timer, b53_hb_beats,
+		   ((s64)b53_ref_mul - 1717986918LL) * 1000000LL / 1717986918LL,
+		   b53_rearms, b53_fix_head);
+	n = min(b53_fix_head, (unsigned int)B53_FIX_RING);
+	if (n) {
+		seq_puts(m, "fixes (src: r=read path, h=heartbeat, b=boot), newest last\n");
+		seq_puts(m, "src  raw             comp_before    error\n");
+		for (i = n; i > 0; i--) {
+			struct b53_fix *f = &b53_fixes[(b53_fix_head - i) % B53_FIX_RING];
+
+			seq_printf(m, " %c   %-15llx %11lld %11lld\n", f->src, f->raw, f->comp, f->err);
+		}
 	}
 
 	seq_puts(m, "\nclamp size (ticks behind last, 12.5ns/tick)\n");
@@ -503,8 +774,8 @@ static int b53_timer_proc_show(struct seq_file *m, void *v)
 
 		for (large = 1; large >= 0; large--) {
 			unsigned int head = st->ring_head[large];
-			unsigned int n = min(head, (unsigned int)B53_RING_SIZE);
 
+			n = min(head, (unsigned int)B53_RING_SIZE);
 			for (i = n; i > 0; i--) {
 				struct b53_sample *smp = &st->ring[large][(head - i) % B53_RING_SIZE];
 
@@ -525,20 +796,44 @@ static int b53_timer_proc_open(struct inode *inode, struct file *file)
 	return single_open(file, b53_timer_proc_show, NULL);
 }
 
-/* Reset the statistics; the filter state (last, holding) is left alone. */
+/*
+ * "inject <ticks>": fake a counter view offset (0 to end it). Every CPU's
+ * armed comparator is shifted too, so timers armed before the jump become
+ * late (or early) exactly as with the real fault.
+ * Anything else: reset the statistics (filter/compensation state kept).
+ */
 static ssize_t b53_timer_proc_write(struct file *file, const char __user *buf,
 				    size_t count, loff_t *ppos)
 {
+	char cmd[40];
+	size_t len = min(count, sizeof(cmd) - 1);
 	int cpu;
+
+	if (copy_from_user(cmd, buf, len))
+		return -EFAULT;
+	cmd[len] = 0;
+	if (!strncmp(cmd, "inject ", 7)) {
+		s64 val;
+
+		if (kstrtoll(strim(cmd + 7), 0, &val))
+			return -EINVAL;
+		WRITE_ONCE(b53_inject_shift, val - READ_ONCE(b53_inject));
+		WRITE_ONCE(b53_inject, val);
+		for_each_online_cpu(cpu)
+			irq_work_queue_on(per_cpu_ptr(&b53_inject_work, cpu), cpu);
+		pr_info("B53: test injection now %lld ticks\n", val);
+		return count;
+	}
 
 	for_each_possible_cpu(cpu) {
 		struct b53_timer_state *st = per_cpu_ptr(&b53_timer_state, cpu);
 
 		st->clamped = st->episodes = st->checked = 0;
-		st->rejected = st->resynced = st->unstable = 0;
+		st->rejected = st->resynced = st->unstable = st->ref_checked = 0;
 		memset(st->clamp_hist, 0, sizeof(st->clamp_hist));
 		st->ring_head[0] = st->ring_head[1] = 0;
 	}
+	b53_rearms = b53_hb_beats = 0;
 	return count;
 }
 
@@ -550,10 +845,59 @@ static const struct file_operations b53_timer_proc_fops = {
 	.release	= single_release,
 };
 
+static void b53_ref_noop(unsigned long unused) { }
+
+/* Set up the reference (free-running) and heartbeat peripheral timers. */
+static void __init b53_ref_init(void)
+{
+	u64 a0, r0, a1, r1;
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		init_irq_work(per_cpu_ptr(&b53_rearm_work, cpu), b53_rearm_fn);
+		init_irq_work(per_cpu_ptr(&b53_inject_work, cpu), b53_inject_fn);
+	}
+	seqcount_init(&b53_anchor_seq);
+
+	b53_ref_timer = ext_timer_alloc(EXT_TIMER_INVALID, B53_REF_PERIOD_US, b53_ref_noop, 0);
+	if (b53_ref_timer < 0) {
+		pr_warn("B53: no free peripheral timer for the reference\n");
+		return;
+	}
+	b53_ref_cnt = ioremap(B53_REF_CNT_PHYS + 8 * b53_ref_timer, 8);
+	if (!b53_ref_cnt) {
+		ext_timer_free(b53_ref_timer);
+		b53_ref_timer = -1;
+		return;
+	}
+
+	/* initial rate: 100ms, refined by the heartbeat afterwards */
+	a0 = arch_counter_get_cntpct();
+	r0 = b53_ref_read();
+	msleep(100);
+	a1 = arch_counter_get_cntpct();
+	r1 = b53_ref_read();
+	b53_ref_mul = (u32)div64_u64((a1 - a0) << 32, r1 - r0);
+
+	write_seqcount_begin(&b53_anchor_seq);
+	b53_anchor_arch = arch_counter_get_cntpct();
+	b53_anchor_ref = b53_ref_read();
+	write_seqcount_end(&b53_anchor_seq);
+	WRITE_ONCE(b53_ref_ready, true);
+
+	b53_hb_timer = ext_timer_alloc(EXT_TIMER_INVALID, B53_HB_PERIOD_US, b53_heartbeat, 0);
+	if (b53_hb_timer < 0)
+		pr_warn("B53: no free peripheral timer for the heartbeat\n");
+	pr_info("B53: reference on peripheral timer %d, heartbeat on timer %d, rate %llu/%llu\n",
+		b53_ref_timer, b53_hb_timer, a1 - a0, r1 - r0);
+}
+
 static int __init b53_timer_proc_init(void)
 {
-	if ((read_cpuid_id() & MIDR_CPU_MODEL_MASK) == MIDR_BRAHMA_B53)
-		proc_create("b53_timer", 0644, NULL, &b53_timer_proc_fops);
+	if ((read_cpuid_id() & MIDR_CPU_MODEL_MASK) != MIDR_BRAHMA_B53)
+		return 0;
+	b53_ref_init();
+	proc_create("b53_timer", 0644, NULL, &b53_timer_proc_fops);
 	return 0;
 }
 late_initcall(b53_timer_proc_init);
@@ -695,8 +1039,8 @@ static const struct arch_timer_erratum_workaround ool_workarounds[] = {
 		.desc = "Broadcom B53 Timer Erratum",
 		.read_cntpct_el0 = b53_read_cntpct_el0,
 		.read_cntvct_el0 = b53_read_cntvct_el0,
-		.set_next_event_phys = erratum_set_next_event_tval_phys,
-		.set_next_event_virt = erratum_set_next_event_tval_virt,
+		.set_next_event_phys = b53_set_next_event_phys,
+		.set_next_event_virt = b53_set_next_event_virt,
 	},
 #ifdef CONFIG_SUN50I_ERRATUM_UNKNOWN1
 	{
