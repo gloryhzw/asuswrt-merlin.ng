@@ -326,9 +326,10 @@ static u64 notrace arm64_858921_read_cntvct_el0(void)
  * Broadcom Brahma-B53 counter read erratum workaround.
  *
  * Reads of the 80MHz system counter (cntpct_el0 / cntvct_el0) occasionally
- * return a value behind the previous read (measured on RT-BE92U: -5 to
- * -239 ticks, i.e. < 3us). Every CPU sees the same bad values at the same
- * time, so it is the shared counter itself.
+ * return a value behind the previous read. Measured on RT-BE92U: mostly
+ * 1-127 ticks (< 1.6us), with a second group at 2048-16383 ticks
+ * (25-205us) under heavy read load. All CPUs see the same events at the
+ * same rate, so it is the shared counter itself.
  *
  * Each CPU remembers the last value it handed out:
  *

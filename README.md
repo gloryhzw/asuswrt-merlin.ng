@@ -30,9 +30,20 @@ This fork contains the independent discovery, root-cause analysis, and kernel-le
 #### Measured: counter reads that go backwards
 Reads of the 80 MHz architectural system counter (`cntpct_el0` / `cntvct_el0`) occasionally return a value **behind the previous read**. Measured on the RT-BE92U with `test_b53_bidir` and `b53_timer_test` (unfiltered kernel):
 
-- Drop sizes of **-5 to -239 ticks** (60 ns to ~3 µs); the large majority are under 80 ticks.
-- Roughly 1 in 40,000 to 1 in 200,000 reads when all 4 cores read in a tight loop.
-- All cores see **the same bad value at the same moment** (e.g. `0x3e3ab847a -> 0x3e3ab842b` on cores 0 and 1), so it is the shared counter, not per-core skew.
+- Drop sizes measured by the kernel's own `/proc/b53_timer` histogram (Kernel #19):
+  - **Normal load**: 1 to 127 ticks (12.5 ns to 1.6 µs), about 2 clamped reads per second across all CPUs.
+  - **All 4 cores reading in a tight loop** (`b53_timer_test`, 185 M reads in 10 s): about 60 glitch events per second, with two groups of sizes: 1 to 127 ticks, and **2,048 to 16,383 ticks (25 to 205 µs)**, plus a few in between. No drop reached 2^14 ticks or more.
+
+  ```
+  clamp size (ticks)   cpu0   cpu1   cpu2   cpu3
+       4-7              361    356    380    352
+      32-63             292    294    310    298
+    2048-4095           122    121    121    121
+    4096-8191           234    232    232    233
+    8192-16383          120    119    119    119
+  ```
+- All cores see **the same bad value at the same moment** (e.g. `0x3e3ab847a -> 0x3e3ab842b` on cores 0 and 1), and the histogram counts are nearly identical on every CPU, so it is the shared counter, not per-core skew.
+- The 2,048 to 16,383 tick group matches a carry into bits 11 to 13 being read before it settles. Every measured drop is still well inside the 1 ms (80,000 tick) clamp window.
 - The suspected mechanism is an asynchronous ripple-carry counter whose low bits are briefly read before a carry has settled. This is a hypothesis consistent with the data, not a confirmed silicon description.
 
 #### Why a tiny glitch reboots the router
@@ -44,20 +55,20 @@ Linux assumes the counter never goes backwards. A drop of even 1 tick produces a
 The end result observed in crash logs was CPU 0 stalling, `wdtd` not petting `/dev/watchdog`, and a hardware watchdog reset (`BOOT REASON WATCHDOG 0x3424`).
 
 #### Not measured: large glitches and forward spikes
-Earlier analysis assumed glitches could also be large (a carry into bit 20, 32 or 44, i.e. 13 ms, 53.7 s or days) or **forward** (+53.7 s for bit 32), and that the TVAL hardware adder (`CVAL = counter + TVAL`) could latch such a value and push a timer far into the future. **None of this has been observed.** The 0.6 to 13 ms "forward glitches" reported by `test_b53_bidir` are gaps where the test thread was preempted (its threshold flags any gap over 625 µs, and no matching backward correction ever follows). The current filter still defends against large glitches in both directions, because doing so costs almost nothing.
+Earlier analysis assumed glitches could also be much larger (a carry into bit 20, 32 or 44, i.e. 13 ms, 53.7 s or days) or **forward** (+53.7 s for bit 32), and that the TVAL hardware adder (`CVAL = counter + TVAL`) could latch such a value and push a timer far into the future. **None of this has been observed.** The 0.6 to 13 ms "forward glitches" reported by `test_b53_bidir` are gaps where the test thread was preempted (its threshold flags any gap over 625 µs, and no matching backward correction ever follows). The current filter still defends against large glitches in both directions, because doing so costs almost nothing.
 
 ### 2. The Kernel Fixes
 
 1. **Pair-verified counter filter (`drivers/clocksource/arm_arch_timer.c`)**:
    Hooked through the arm64 out-of-line timer erratum framework (`ARM64_WORKAROUND_B53_TIMER`, matched on the Brahma-B53 MIDR), so every kernel read, `sched_clock()` and every userspace `mrs cntvct_el0` (trapped) goes through it. Each CPU remembers the last value it returned:
    - **Forward step < 1 ms**: normal case, returned as-is.
-   - **Backward step < 1 ms**: a read glitch. The previous value is returned again, so the clock holds for a few ticks instead of going backwards.
+   - **Backward step < 1 ms**: a read glitch. The previous value is returned again, so the clock holds for a few reads instead of going backwards.
    - **Any larger jump, either direction** (first read on a CPU, wake from idle, or a large glitch): the value is re-read until two back-to-back reads agree (in order, within 12.8 µs). A single bad read is therefore never returned, stored, or used to program a timer. If the agreed value is still ≥ 1 ms behind the stored one, the stored value was the bad one and the CPU resyncs to the counter.
-   - **Diagnostics**: per-CPU counts of each path are exposed in `/proc/b53_timer` (`clamped`, `checked`, `rejected`, `resynced`, `unstable`). This replaces inference with data: a non-zero `rejected` would be the first evidence of a large glitch.
+   - **Diagnostics**: `/proc/b53_timer` shows per-CPU counts of each path (`clamped`, `episodes` = runs of consecutive clamped reads, `checked`, `rejected`, `resynced`, `unstable`) and a log2 histogram of clamp sizes. `echo 0 > /proc/b53_timer` resets the statistics. A non-zero `rejected` would be the first evidence of a glitch of 1 ms or more.
    - Per-CPU state with no locks or shared cache lines. The fast path adds a compare and a store to each read; the read path makes no function calls (safe for `notrace` / `sched_clock`).
 
 2. **Timer programming via CVAL (`drivers/clocksource/arm_arch_timer.c`)**:
-   `.set_next_event_phys/virt` use the framework's `erratum_set_next_event_tval_*`, which computes `CVAL = filtered counter + delta` in software and writes `cntp_cval_el0`/`cntv_cval_el0`, instead of writing `TVAL` and letting hardware add it to a possibly glitched counter. With measured glitch sizes the error from `TVAL` would be ≤ 3 µs, so this is defensive.
+   `.set_next_event_phys/virt` use the framework's `erratum_set_next_event_tval_*`, which computes `CVAL = filtered counter + delta` in software and writes `cntp_cval_el0`/`cntv_cval_el0`, instead of writing `TVAL` and letting hardware add it to a possibly glitched counter. With measured glitch sizes the error from `TVAL` would be ≤ 205 µs (a timer firing early or late by at most that), so this is defensive.
 
 3. **Scheduler clock underflow guard (`kernel/time/sched_clock.c`)**:
    - `sched_clock()` treats a negative delta against the epoch as 0 instead of ~28.5 years.
@@ -119,7 +130,8 @@ chmod +x /tmp/b53_bench
 - **Kernel #14 (+ CVAL timer programming)**: watchdog resets every 30–78 hours. The explanation at the time was a forward spike being stored as the last value and freezing the clock; since no forward spike has ever been measured, **the cause of these resets is unconfirmed**. The IRQ 41 affinity and RT throttling changes (fixes 6 and 7) were made in the same period.
 - **Kernel #15 / #16 (stateless double-read)**: comparing two consecutive reads within 32 ticks let 81–239 tick drops through, because both reads can land in the same glitch. Per-CPU state is required.
 - **Kernel #17 (12.5 ms clamp + forward spike check)**: `b53_timer_test` 186.3 M reads with **0 glitches**; `b53_bench -a 3` all 7 tests pass (13.6 M inter-core reads with 0 underflows; 13.7 M syscall checks at 4.57 Mops; 29,000+ timer reprogrammings with 0 missed or delayed wakeups). Two weaknesses: any drop of 12.5 ms or more was returned as a "rollover" (the counter cannot roll over for ~28 years), and `update_sched_clock()` could move the epoch backwards.
-- **Kernel #18 (pair-verified filter, this revision)**: fixes both weaknesses and adds `/proc/b53_timer`. **Status: not yet built or run on hardware.** Treat it as proven only after more than 7 days of uptime (well past #14's 30–78 h failure window) with `resynced` and `unstable` at 0.
+- **Kernel #18 (pair-verified filter)**: fixes both weaknesses and adds `/proc/b53_timer`.
+- **Kernel #19 (+ clamp-size histogram, current)**: `b53_timer_test` 185.3 M reads with **0 glitches**; `rejected`, `resynced` and `unstable` all 0. Glitch sizes are documented in section 1. **Status: soak test started Oct 5 2026.** Treat it as proven only after more than 7 days of uptime (well past #14's 30–78 h failure window) with `rejected`, `resynced` and `unstable` still at 0.
 
 ### 5. Key File Locations & Source Code Map
 
