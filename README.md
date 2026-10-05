@@ -124,5 +124,43 @@ chmod +x /tmp/b53_bench
     - Over **13.6 million** inter-core reads: **0 underflows**, max core skew bounded to 0.625 µs.
     - Over **13.7 million** cross-core syscall checks at **4.57 Mops**: **0 underflow crashes**, bounded to < 2 µs.
     - Over **29,000** timer reprogrammings across all 4 cores at **9,685 events/sec**: **0 missed timer interrupts**, **0 delayed wakeups**, **0 premature firings**.
-    - Throughput: `mrs cntvct_el0` at **4.83 M reads/sec** with 206.9 ns average latency.
     - All 7 validation tests pass with 100% success.
+
+### 5. Key File Locations & Source Code Map
+
+All key patches, test suites, and automation tools are organized across the workspace and router filesystem:
+
+#### A. Kernel Source Code Patches (in `release/src-rt-5.04behnd.4916/kernel/linux-4.19/`)
+- **Timer Counter Filter & Silicon TVAL Bypass**:
+  [`drivers/clocksource/arm_arch_timer.c`](drivers/clocksource/arm_arch_timer.c) — Contains `b53_read_cntpct_el0`, `b53_read_cntvct_el0`, and `erratum_set_next_event_tval_phys/virt`.
+- **Scheduler Clock Guard**:
+  [`kernel/time/sched_clock.c`](kernel/time/sched_clock.c) — Epoch delta clamping against 28.5-year underflow.
+- **Timekeeping Validation Kconfig**:
+  [`arch/arm64/Kconfig`](arch/arm64/Kconfig) — Enables `CONFIG_CLOCKSOURCE_VALIDATE_LAST_CYCLE=y`.
+- **Userspace vDSO Monotonic Clamp**:
+  [`arch/arm64/kernel/vdso/gettimeofday.S`](arch/arm64/kernel/vdso/gettimeofday.S) — Assembly sign-bit clamp for virtual counter delta.
+- **Watchdog Panic Governor**:
+  [`drivers/watchdog/pretimeout_panic.c`](drivers/watchdog/pretimeout_panic.c) — Kernel panic handler on watchdog pretimeout.
+- **Kernel Platform Defconfig**:
+  [`arch/arm64/configs/bcm96765_defconfig`](arch/arm64/configs/bcm96765_defconfig) — Microsecond printk timestamps and pretimeout panic governor options.
+
+#### B. Validation & Test Suites
+- **Unified Erratum & Clock Benchmark**:
+  [`/home/glory/b53_bench.c`](file:///home/glory/b53_bench.c) — Bare-metal 7-suite C benchmark (source). Deployed on router at `/jffs/b53_bench`.
+- **Hardware Timer Glitch Detector**:
+  Native multi-core RAW instruction reader binary deployed on router at `/jffs/b53_timer_test`.
+
+#### C. Build & Flashing Tools
+- **Environment Setup**:
+  [`/home/glory/merlin/setup_env.sh`](file:///home/glory/merlin/setup_env.sh) — Sets cross-compiler paths, automake shims, and defines `build_be92u`.
+- **Automated Web UI Flasher**:
+  [`/home/glory/upload_firmware.py`](file:///home/glory/upload_firmware.py) — Python script for Asuswrt Login v2 HTTP streaming firmware upgrades.
+- **Hourly Cron Uptime Monitor**:
+  [`/home/glory/check_router_time.sh`](file:///home/glory/check_router_time.sh) — Verifies uptime and sends ntfy push alerts.
+
+#### D. Router Startup Scripts (Persistent in `/jffs/scripts/`)
+- **Watchdog Affinity & Microsecond Logging**:
+  `/jffs/scripts/init-start` — Routes IRQ 41 to CPUs 1–3 (`smp_affinity: e`) and enables `printk.time=Y`.
+- **RT Throttling Disablement & Daemon Priority**:
+  `/jffs/scripts/services-start` — Sets `sched_rt_runtime_us = -1` and sets `wdtd` to `nice -20`.
+
