@@ -7108,6 +7108,7 @@ else ifeq ($(BCMWL6A),y)
 	-sed -i 's/Broadcom BCA image upgrade package tree binary/$(BUILD_NAME)/g' bootloaders/build/work/generate_bundle_itb
    endif
 	-sed -i 's/ASUSFLAG_IN_BOOT/$(ASUSFLAG_IN_BOOT)/g' bootloaders/build/work/generate_bundle_itb
+	-chmod +x bootloaders/build/work/generate_bundle_itb
    ifneq (,$(wildcard $(LINUXDIR)/../dts/$(BCM_CHIP)/$(BCM_CHIP)_pinctrl.dtsi.$(BUILD_NAME)))
 	cp -f $(LINUXDIR)/../dts/$(BCM_CHIP)/$(BCM_CHIP)_pinctrl.dtsi.$(BUILD_NAME) $(LINUXDIR)/../dts/$(BCM_CHIP)/$(BCM_CHIP)_pinctrl.dtsi
    endif
