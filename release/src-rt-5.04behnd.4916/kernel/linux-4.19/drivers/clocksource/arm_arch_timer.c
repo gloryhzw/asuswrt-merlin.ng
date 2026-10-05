@@ -341,16 +341,21 @@ static u64 notrace arm64_858921_read_cntvct_el0(void)
  *    or used to program cval. A confirmed value far behind 'last' means
  *    'last' itself was bad, so resync to it instead of holding forever.
  *
- * Per-CPU counts of each path are reported in /proc/b53_timer.
+ * Per-CPU counts of each path, and a log2 histogram of clamp sizes, are
+ * reported in /proc/b53_timer. Writing anything to it resets the counters.
  */
 #define B53_FAST_WINDOW		80000ULL	/* 1ms @ 80MHz */
 #define B53_CLAMP_WINDOW	80000ULL	/* 1ms @ 80MHz */
 #define B53_PAIR_WINDOW		1024ULL		/* 12.8us @ 80MHz */
 #define B53_PAIR_RETRIES	8
+#define B53_HIST_BUCKETS	18		/* fls64(1 .. 79999) = 1 .. 17 */
 
 struct b53_timer_state {
 	u64 last[2];			/* [0] = cntpct, [1] = cntvct */
-	unsigned long clamped;		/* small backward step held at last */
+	unsigned long clamped;		/* reads held at last (small backward step) */
+	unsigned long episodes;		/* runs of consecutive clamped reads */
+	unsigned long clamp_hist[B53_HIST_BUCKETS]; /* by fls64(last - raw) */
+	bool holding;			/* previous read on this CPU was clamped */
 	unsigned long checked;		/* large step re-read as a pair */
 	unsigned long rejected;		/* first read was >= 1ms off the pair */
 	unsigned long resynced;		/* pair >= 1ms behind last: last was bad */
@@ -358,6 +363,17 @@ struct b53_timer_state {
 };
 
 static DEFINE_PER_CPU(struct b53_timer_state, b53_timer_state);
+
+static __always_inline u64 b53_clamp(struct b53_timer_state *st, u64 prev, u64 behind)
+{
+	st->clamped++;
+	st->clamp_hist[fls64(behind)]++;
+	if (!st->holding) {
+		st->holding = true;
+		st->episodes++;
+	}
+	return prev;
+}
 
 static __always_inline u64 b53_read_raw(bool virt)
 {
@@ -398,10 +414,8 @@ static __always_inline u64 b53_read_counter(bool virt)
 		goto accept;
 	}
 
-	if (d < 0 && -d < B53_CLAMP_WINDOW) {
-		st->clamped++;
-		return prev;
-	}
+	if (d < 0 && -d < B53_CLAMP_WINDOW)
+		return b53_clamp(st, prev, -d);
 
 	st->checked++;
 	cur = b53_read_pair(virt, st);
@@ -410,13 +424,12 @@ static __always_inline u64 b53_read_counter(bool virt)
 
 	d = cur - prev;
 	if (d < 0) {
-		if (-d < B53_CLAMP_WINDOW) {
-			st->clamped++;
-			return prev;
-		}
+		if (-d < B53_CLAMP_WINDOW)
+			return b53_clamp(st, prev, -d);
 		st->resynced++;
 	}
 accept:
+	st->holding = false;
 	st->last[virt] = cur;
 	return cur;
 }
@@ -433,23 +446,70 @@ static u64 notrace b53_read_cntvct_el0(void)
 
 static int b53_timer_proc_show(struct seq_file *m, void *v)
 {
-	int cpu;
+	int cpu, i;
 
-	seq_puts(m, "cpu    clamped    checked   rejected   resynced   unstable\n");
+	seq_puts(m, "cpu    clamped   episodes    checked   rejected   resynced   unstable\n");
 	for_each_online_cpu(cpu) {
 		struct b53_timer_state *st = per_cpu_ptr(&b53_timer_state, cpu);
 
-		seq_printf(m, "%3d %10lu %10lu %10lu %10lu %10lu\n", cpu,
-			   st->clamped, st->checked, st->rejected,
+		seq_printf(m, "%3d %10lu %10lu %10lu %10lu %10lu %10lu\n", cpu,
+			   st->clamped, st->episodes, st->checked, st->rejected,
 			   st->resynced, st->unstable);
+	}
+
+	seq_puts(m, "\nclamp size (ticks behind last, 12.5ns/tick)\n");
+	seq_puts(m, "         range");
+	for_each_online_cpu(cpu)
+		seq_printf(m, "       cpu%d", cpu);
+	seq_putc(m, '\n');
+	for (i = 1; i < B53_HIST_BUCKETS; i++) {
+		unsigned long sum = 0;
+
+		for_each_online_cpu(cpu)
+			sum += per_cpu_ptr(&b53_timer_state, cpu)->clamp_hist[i];
+		if (!sum)
+			continue;
+		seq_printf(m, "%6lu-%-7lu", 1UL << (i - 1), (1UL << i) - 1);
+		for_each_online_cpu(cpu)
+			seq_printf(m, " %10lu", per_cpu_ptr(&b53_timer_state, cpu)->clamp_hist[i]);
+		seq_putc(m, '\n');
 	}
 	return 0;
 }
 
+static int b53_timer_proc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, b53_timer_proc_show, NULL);
+}
+
+/* Reset the statistics; the filter state (last, holding) is left alone. */
+static ssize_t b53_timer_proc_write(struct file *file, const char __user *buf,
+				    size_t count, loff_t *ppos)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		struct b53_timer_state *st = per_cpu_ptr(&b53_timer_state, cpu);
+
+		st->clamped = st->episodes = st->checked = 0;
+		st->rejected = st->resynced = st->unstable = 0;
+		memset(st->clamp_hist, 0, sizeof(st->clamp_hist));
+	}
+	return count;
+}
+
+static const struct file_operations b53_timer_proc_fops = {
+	.open		= b53_timer_proc_open,
+	.read		= seq_read,
+	.write		= b53_timer_proc_write,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
 static int __init b53_timer_proc_init(void)
 {
 	if ((read_cpuid_id() & MIDR_CPU_MODEL_MASK) == MIDR_BRAHMA_B53)
-		proc_create_single("b53_timer", 0444, NULL, b53_timer_proc_show);
+		proc_create("b53_timer", 0644, NULL, &b53_timer_proc_fops);
 	return 0;
 }
 late_initcall(b53_timer_proc_init);
