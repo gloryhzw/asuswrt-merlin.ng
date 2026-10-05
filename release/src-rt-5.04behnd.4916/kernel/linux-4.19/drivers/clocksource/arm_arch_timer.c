@@ -343,6 +343,7 @@ static u64 notrace arm64_858921_read_cntvct_el0(void)
  * Reads: each CPU remembers the last value it handed out.
  * 1. Forward step < 1ms: accept.
  * 2. Backward step < 1ms: hold the last value (the clock pauses briefly).
+ *    A value below the last one is never returned, whatever the cause.
  * 3. Larger step either way: re-read until two back-to-back reads agree
  *    (drops momentary glitches), then check the elapsed time against an
  *    independent Broadcom peripheral timer. If they disagree, the counter
@@ -373,7 +374,13 @@ static u64 notrace arm64_858921_read_cntvct_el0(void)
 #define B53_HIST_BUCKETS	18		/* fls64(1 .. 79999) = 1 .. 17 */
 #define B53_LARGE_CLAMP		1024ULL		/* ring buffer split: 12.8us */
 #define B53_RING_SIZE		8
-#define B53_REF_TOL		2000LL		/* 25us */
+/*
+ * Only offsets of 1ms or more are corrected. The view also gains ~300ppm in
+ * small forward steps (25-90us) that never come back; that is harmless
+ * (every CPU and comparator shares the view, NTP fixes wall time) and is
+ * absorbed, not corrected.
+ */
+#define B53_REF_TOL		80000LL		/* 1ms */
 #define B53_REF_BRACKET		64ULL		/* max arch ticks around one ref read (0.8us) */
 #define B53_HB_PERIOD_US	10000UL		/* heartbeat: 10ms */
 #define B53_REF_PERIOD_US	(0x3FFFFFFFFFFFFFFFULL / 200)	/* never wraps */
@@ -399,7 +406,7 @@ struct b53_timer_state {
 	unsigned int ring_head[2];
 	unsigned long checked;		/* large step re-read as a pair */
 	unsigned long rejected;		/* first read was >= 1ms off the pair */
-	unsigned long resynced;		/* pair >= 1ms behind last: last was bad */
+	unsigned long bigheld;		/* >= 1ms behind last after checks: held */
 	unsigned long unstable;		/* no agreeing pair within retries */
 	unsigned long ref_checked;	/* large step checked against the ref */
 };
@@ -588,7 +595,10 @@ static __always_inline u64 b53_read_counter(bool virt)
 			b53_comp_fix(comp, -d, cur - comp, 'b');
 			cur = prev;
 		} else {
-			st->resynced++;		/* the ref says 'last' was wrong */
+			/* 'last' was ahead (a forward offset already handed
+			 * out): never go backward, hold until time catches up */
+			st->bigheld++;
+			return prev;
 		}
 	} else if (!READ_ONCE(b53_ref_ready) && comp > 0 &&
 		   abs(d - comp) < (s64)B53_CLAMP_WINDOW) {
@@ -596,6 +606,8 @@ static __always_inline u64 b53_read_counter(bool virt)
 		 * compensation means the offset ended */
 		b53_comp_fix(comp, -comp, cur - comp, 'b');
 		cur -= comp;
+		if ((s64)(cur - prev) < 0)
+			return prev;	/* never below what was handed out */
 	}
 accept:
 	st->holding = false;
@@ -751,13 +763,13 @@ static int b53_timer_proc_show(struct seq_file *m, void *v)
 	int cpu, i;
 	unsigned int n;
 
-	seq_puts(m, "cpu    clamped   episodes    checked   rejected   resynced   unstable  refchecks\n");
+	seq_puts(m, "cpu    clamped   episodes    checked   rejected    bigheld   unstable  refchecks\n");
 	for_each_online_cpu(cpu) {
 		struct b53_timer_state *st = per_cpu_ptr(&b53_timer_state, cpu);
 
 		seq_printf(m, "%3d %10lu %10lu %10lu %10lu %10lu %10lu %10lu\n", cpu,
 			   st->clamped, st->episodes, st->checked, st->rejected,
-			   st->resynced, st->unstable, st->ref_checked);
+			   st->bigheld, st->unstable, st->ref_checked);
 	}
 
 	seq_printf(m, "\ninjected (test): %lld ticks\n", READ_ONCE(b53_inject));
@@ -854,7 +866,7 @@ static ssize_t b53_timer_proc_write(struct file *file, const char __user *buf,
 		struct b53_timer_state *st = per_cpu_ptr(&b53_timer_state, cpu);
 
 		st->clamped = st->episodes = st->checked = 0;
-		st->rejected = st->resynced = st->unstable = st->ref_checked = 0;
+		st->rejected = st->bigheld = st->unstable = st->ref_checked = 0;
 		memset(st->clamp_hist, 0, sizeof(st->clamp_hist));
 		st->ring_head[0] = st->ring_head[1] = 0;
 	}
