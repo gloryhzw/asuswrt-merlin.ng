@@ -43,8 +43,16 @@ Reads of the 80 MHz architectural system counter (`cntpct_el0` / `cntvct_el0`) o
     8192-16383          120    119    119    119
   ```
 - All cores see **the same bad value at the same moment** (e.g. `0x3e3ab847a -> 0x3e3ab842b` on cores 0 and 1), and the histogram counts are nearly identical on every CPU, so it is the shared counter, not per-core skew.
-- The 2,048 to 16,383 tick group matches a carry into bits 11 to 13 being read before it settles. Every measured drop is still well inside the 1 ms (80,000 tick) clamp window.
-- The suspected mechanism is an asynchronous ripple-carry counter whose low bits are briefly read before a carry has settled. This is a hypothesis consistent with the data, not a confirmed silicon description.
+
+#### Measured: what a bad value looks like (Kernel #20 episode samples)
+- **Torn carries.** A bad value appears right after a carry. Each bit is either its old or its new value, as if part of the carry had not arrived yet. The split is usually around bit 10/11.
+- **The offset persists and keeps counting.** A bad value is not a single wrong read. The counter view as a whole is shifted and keeps counting at the normal rate with that offset until the stale bits catch up:
+  - small group: 64–94 ticks behind, lasting ~18 µs;
+  - large group (the 2,048–16,383 histogram rows): up to ~15,500 ticks (194 µs) behind.
+- **Mostly backward, but not always.** Almost every offset reads low. One forward offset of +2,026 ticks has been seen.
+- **One momentary error of 1 ms or more** (`rejected = 1`). It vanished on the next read, so the pair check dropped it.
+- **The view gains time.** Compared with the Broadcom peripheral timer, the arch counter view gains ~250–300 ppm in small forward steps of 25–90 µs that never come back. The kernel measured up to ~900 ppm in the first minutes after boot. The peripheral timer itself tracks NTP time within ~30 ppm.
+- The suspected mechanism is a counter whose carry ripples into the upper bits slowly enough to be read half-done. This is a hypothesis consistent with the data, not a confirmed silicon description.
 
 #### Why a tiny glitch reboots the router
 Linux assumes the counter never goes backwards. A drop of even 1 tick produces a huge unsigned delta in code that does `(now - last) & mask`:
@@ -54,8 +62,12 @@ Linux assumes the counter never goes backwards. A drop of even 1 tick produces a
 
 The end result observed in crash logs was CPU 0 stalling, `wdtd` not petting `/dev/watchdog`, and a hardware watchdog reset (`BOOT REASON WATCHDOG 0x3424`).
 
-#### Not measured: large glitches and forward spikes
-Earlier analysis assumed glitches could also be much larger (a carry into bit 20, 32 or 44, i.e. 13 ms, 53.7 s or days) or **forward** (+53.7 s for bit 32), and that the TVAL hardware adder (`CVAL = counter + TVAL`) could latch such a value and push a timer far into the future. **None of this has been observed.** The 0.6 to 13 ms "forward glitches" reported by `test_b53_bidir` are gaps where the test thread was preempted (its threshold flags any gap over 625 µs, and no matching backward correction ever follows). The current filter still defends against large glitches in both directions, because doing so costs almost nothing.
+#### Not yet measured: large persistent offsets
+Because offsets persist, a stale carry into a higher bit (bit 20, 32 or 44, i.e. 13 ms, 53.7 s or days) would shift the whole counter view by that much. The hardware timer comparator compares against **the same shifted view**, so a large backward offset would make every CPU's timer late by that amount. Nothing would crash, but time and all timer interrupts would stop, and the watchdog would reset the board.
+
+- **No persistent offset of 1 ms or more has been observed** (the kernel's `fixes` count has stayed at 0 outside of tests).
+- The 0928 crash fits this picture: a watchdog pretimeout with CPU 0 idle and none of the other stall detectors firing, which is what a global timer stall would look like. It is still **unconfirmed** that large offsets cause the reboots. Kernel #23 corrects them and counts each one, so the soak test can answer this.
+- The 0.6 to 13 ms "forward glitches" reported by `test_b53_bidir` are gaps where the test thread was preempted (its threshold flags any gap over 625 µs, and no matching backward correction ever follows).
 
 ### 2. The Kernel Fixes
 
@@ -63,12 +75,24 @@ Earlier analysis assumed glitches could also be much larger (a carry into bit 20
    Hooked through the arm64 out-of-line timer erratum framework (`ARM64_WORKAROUND_B53_TIMER`, matched on the Brahma-B53 MIDR), so every kernel read, `sched_clock()` and every userspace `mrs cntvct_el0` (trapped) goes through it. Each CPU remembers the last value it returned:
    - **Forward step < 1 ms**: normal case, returned as-is.
    - **Backward step < 1 ms**: a read glitch. The previous value is returned again, so the clock holds for a few reads instead of going backwards.
-   - **Any larger jump, either direction** (first read on a CPU, wake from idle, or a large glitch): the value is re-read until two back-to-back reads agree (in order, within 12.8 µs). A single bad read is therefore never returned, stored, or used to program a timer. If the agreed value is still ≥ 1 ms behind the stored one, the stored value was the bad one and the CPU resyncs to the counter.
-   - **Diagnostics**: `/proc/b53_timer` shows per-CPU counts of each path (`clamped`, `episodes` = runs of consecutive clamped reads, `checked`, `rejected`, `resynced`, `unstable`) and a log2 histogram of clamp sizes. `echo 0 > /proc/b53_timer` resets the statistics. A non-zero `rejected` would be the first evidence of a glitch of 1 ms or more.
-   - Per-CPU state with no locks or shared cache lines. The fast path adds a compare and a store to each read; the read path makes no function calls (safe for `notrace` / `sched_clock`).
+   - **Any larger jump, either direction** (first read on a CPU, wake from idle, or a large offset):
+     - The value is re-read until two back-to-back reads agree (in order, within 12.8 µs), which drops momentary glitches.
+     - The agreed value is then checked against an **independent reference**: a Broadcom peripheral timer (`brcm,bcm-timers`, 200 MHz, 62-bit). Each reference read is bracketed by two arch reads and used only if the bracket is under 0.8 µs, because the bus read can stall for tens of µs.
+     - If the arch view is off from the reference by **1 ms or more**, the view is offset. A shared compensation `b53_comp`, added to every read, is corrected by the measured error, so time keeps flowing at the right value. When the offset ends, the compensation is undone the same way.
+   - **Never backwards**: whatever happens, a value below the CPU's last returned value is never returned. A large backward step that the reference does not confirm is held (`bigheld`) instead.
+   - **Small drift is left alone**: the ~300 ppm gain of the arch view is shared by every CPU and every comparator, and NTP corrects wall time, so only offsets of 1 ms or more are corrected. (Kernels #21/#22 also corrected the drift and kept stepping time, see section 4.)
+   - **Heartbeat**: a second peripheral timer interrupts every 10 ms, independent of the arch counter. It catches an offset that starts while every CPU is idle (nobody reads the counter, and every timer is late). It also keeps the arch/reference anchor and rate up to date. A new offset must be seen on two beats in a row; an offset that ends is undone at once.
+   - **Early boot**: before the reference is set up (`late_initcall`), a confirmed backward step is compensated by its own size instead.
+   - **Diagnostics**: `/proc/b53_timer` shows:
+     - per-CPU counts: `clamped`, `episodes` (runs of consecutive clamped reads), `checked`, `rejected`, `bigheld`, `unstable`, `refchecks`;
+     - the current `compensation`, reference state and rate, `rearms`, and `fixes` (a ring of the last 16 corrections);
+     - a log2 histogram of clamp sizes and the clamp-episode samples.
 
-2. **Timer programming via CVAL (`drivers/clocksource/arm_arch_timer.c`)**:
-   `.set_next_event_phys/virt` use the framework's `erratum_set_next_event_tval_*`, which computes `CVAL = filtered counter + delta` in software and writes `cntp_cval_el0`/`cntv_cval_el0`, instead of writing `TVAL` and letting hardware add it to a possibly glitched counter. With measured glitch sizes the error from `TVAL` would be ≤ 205 µs (a timer firing early or late by at most that), so this is defensive.
+     Writing to it resets the statistics. `echo "inject <ticks>" > /proc/b53_timer` fakes a counter view offset for testing; reads and every CPU's comparator see it, like the real fault.
+   - Per-CPU state with no locks on the fast path. The fast path adds a compare and a store to each read; the read path makes no function calls (safe for `notrace` / `sched_clock`).
+
+2. **Timer programming in the raw view (`drivers/clocksource/arm_arch_timer.c`)**:
+   The hardware comparator fires when the **raw** (possibly offset) counter view reaches CVAL. `b53_set_next_event` therefore programs `CVAL = filtered time − b53_comp + delta`, so a timer fires on time even during an offset. Whenever `b53_comp` changes, every CPU re-programs its next event through `irq_work`. Kernels #14–#20 used `CVAL = filtered counter + delta`, which is late by the offset while an offset lasts; with small offsets that error was ≤ 194 µs, but a large offset would delay every timer by its full size.
 
 3. **Scheduler clock underflow guard (`kernel/time/sched_clock.c`)**:
    - `sched_clock()` treats a negative delta against the epoch as 0 instead of ~28.5 years.
@@ -131,13 +155,29 @@ chmod +x /tmp/b53_bench
 - **Kernel #15 / #16 (stateless double-read)**: comparing two consecutive reads within 32 ticks let 81–239 tick drops through, because both reads can land in the same glitch. Per-CPU state is required.
 - **Kernel #17 (12.5 ms clamp + forward spike check)**: `b53_timer_test` 186.3 M reads with **0 glitches**; `b53_bench -a 3` all 7 tests pass (13.6 M inter-core reads with 0 underflows; 13.7 M syscall checks at 4.57 Mops; 29,000+ timer reprogrammings with 0 missed or delayed wakeups). Two weaknesses: any drop of 12.5 ms or more was returned as a "rollover" (the counter cannot roll over for ~28 years), and `update_sched_clock()` could move the epoch backwards.
 - **Kernel #18 (pair-verified filter)**: fixes both weaknesses and adds `/proc/b53_timer`.
-- **Kernel #19 (+ clamp-size histogram, current)**: `b53_timer_test` 185.3 M reads with **0 glitches**; `rejected`, `resynced` and `unstable` all 0. Glitch sizes are documented in section 1. **Status: soak test started Oct 5 2026.** Treat it as proven only after more than 7 days of uptime (well past #14's 30–78 h failure window) with `rejected`, `resynced` and `unstable` still at 0.
+- **Kernel #19 (+ clamp-size histogram)**: `b53_timer_test` 185.3 M reads with **0 glitches**; `rejected`, `resynced` and `unstable` all 0. Glitch sizes are documented in section 1.
+- **Kernel #20 (+ clamp-episode samples, full histogram)**: the samples showed that bad values are torn carries and that the offset persists (section 1). That means a large offset would stall timers, which the filter alone cannot prevent.
+- **Kernel #21 (+ reference timer, compensation, heartbeat, raw-view CVAL)**: first version of the reference check. It kept correcting all the time. Measuring the reference against the build host's NTP clock showed the reference is accurate and the arch view gains ~300 ppm, so #21 was chasing the drift.
+- **Kernel #22 (+ bracketed reference reads)**: removed the error from reference read stalls; the constant corrections remained, which confirmed they came from the drift.
+- **Kernel #23 (correct only ≥ 1 ms offsets, current)**: tolerance raised to 1 ms, a backward step the reference does not confirm is held (`bigheld`), and the early-boot fallback can no longer go backwards. Idle after boot: `fixes` 0, `compensation` 0. **Injection tests** (Oct 6 2026, `b53_timer_test` on all 4 cores plus a verifier comparing `CLOCK_MONOTONIC` and 1 ms sleeps against the reference):
+
+  | Injected offset | Backward reads | Detected / undone (error, ticks) | Step in monotonic time | Worst sleep |
+  |---|---|---|---|---|
+  | none | 0 / 261 M | — | — | 5.1 ms |
+  | −5 ms | 0 / 313 M | −400,224 / +399,951 | none | 9.8 ms |
+  | −2 ms | 0 / 312 M | −160,484 / +159,912 | none | 4.2 ms |
+  | +5 ms | 0 / 315 M | +399,817 / −400,280 | none | 10.1 ms |
+  | −60 s (held 70 s) | 0 / 1.4 G | −4,800,000,136 / +4,799,999,819 | none | 9.9 ms |
+
+  Every offset was caught on the next read and corrected to within ~6 µs, and timers kept firing through the 60 s offset. The ~10 ms worst sleeps also occur with nothing injected (CPU contention from the 4-core read test). Each catch/undo pair leaves a few hundred ticks in `compensation` (reference read noise; 1,625 ticks ≈ 20 µs after 4 pairs).
+
+  **Status: soak test started Oct 6 2026.** Treat it as proven only after more than 7 days of uptime (well past #14's 30–78 h failure window). A non-zero `fixes` with no reboot would show both the cause and the fix.
 
 ### 5. Key File Locations & Source Code Map
 
 #### A. Kernel source (under [`release/src-rt-5.04behnd.4916/kernel/linux-4.19/`](release/src-rt-5.04behnd.4916/kernel/linux-4.19/))
-- **Counter filter, CVAL timer programming, `/proc/b53_timer`**:
-  [`drivers/clocksource/arm_arch_timer.c`](release/src-rt-5.04behnd.4916/kernel/linux-4.19/drivers/clocksource/arm_arch_timer.c) — `b53_read_counter`, `b53_read_pair`, `b53_read_cntpct_el0` / `b53_read_cntvct_el0`, and the `ool_workarounds[]` entry.
+- **Counter filter, reference check, CVAL timer programming, `/proc/b53_timer`**:
+  [`drivers/clocksource/arm_arch_timer.c`](release/src-rt-5.04behnd.4916/kernel/linux-4.19/drivers/clocksource/arm_arch_timer.c) — `b53_read_counter`, `b53_read_pair`, `b53_ref_sample` / `b53_ref_expect` / `b53_comp_fix` (reference check and compensation), `b53_heartbeat`, `b53_ref_init` (allocates the two peripheral timers via `ext_timer_alloc`), `b53_set_next_event` / `b53_rearm_fn`, `b53_read_cntpct_el0` / `b53_read_cntvct_el0`, and the `ool_workarounds[]` entry.
 - **Erratum capability & CPU match**:
   [`arch/arm64/kernel/cpu_errata.c`](release/src-rt-5.04behnd.4916/kernel/linux-4.19/arch/arm64/kernel/cpu_errata.c), [`arch/arm64/include/asm/cpucaps.h`](release/src-rt-5.04behnd.4916/kernel/linux-4.19/arch/arm64/include/asm/cpucaps.h), [`arch/arm64/include/asm/cputype.h`](release/src-rt-5.04behnd.4916/kernel/linux-4.19/arch/arm64/include/asm/cputype.h) — `ARM64_WORKAROUND_B53_TIMER`, `MIDR_BRAHMA_B53`. ([`arch/arm64/kernel/cpufeature.c`](release/src-rt-5.04behnd.4916/kernel/linux-4.19/arch/arm64/kernel/cpufeature.c) adds the B53 to the KPTI safe list.)
 - **Scheduler clock guard**:
@@ -151,12 +191,14 @@ chmod +x /tmp/b53_bench
 - `/home/glory/b53_bench.c` — 7-test benchmark source; deployed on the router as `/jffs/b53_bench`.
 - `/home/glory/merlin/test_b53_bidir.c` — backward/forward glitch logger (the forward column counts preemption gaps; see section 1).
 - `/home/glory/merlin/b53_timer_test` — multi-core glitch detector; deployed as `/jffs/b53_timer_test`.
+- `/home/glory/b53_exp/b53_verify.c` — compares `CLOCK_MONOTONIC` and 1 ms sleeps against the peripheral reference timer (via `/dev/mem`); usage `b53_verify <ref_timer> <secs>`.
+- `/home/glory/b53_exp/k21_test.sh` — the #23 injection test (table in section 4); results in `k23_test.log`.
 
 #### C. Build & flashing tools (local build host, not in this repo)
 - `/home/glory/merlin/setup_env.sh` — toolchain paths and the `build_be92u` helper (build as user `glory`, never root).
 - `/home/glory/upload_firmware.py` — Asuswrt Login v2 Web UI firmware flasher.
-- `/home/glory/check_router_time.sh` — hourly cron check for router reboots, sending ntfy alerts.
+- `/home/glory/check_router_time.sh` — hourly cron check for router reboots, sending ntfy alerts; logs `/proc/b53_timer` to `~/router_b53_timer.log` and alerts on non-zero `rejected` / `bigheld` / `unstable` or a growing `fixes` count.
 
 #### D. Router startup scripts (persistent in `/jffs/scripts/`)
-- `/jffs/scripts/init-start` — routes IRQ 41 to CPUs 1–3 (`smp_affinity: e`) and enables `printk.time=Y`.
+- `/jffs/scripts/init-start` — routes the watchdog IRQ 41 and the B53 heartbeat timer IRQ (found from `/proc/b53_timer`, IRQ 38 on this unit) to CPUs 1–3 (`smp_affinity: e`), so neither depends on CPU 0; enables `printk.time=Y`.
 - `/jffs/scripts/services-start` — sets `sched_rt_runtime_us = -1` and runs `wdtd` at `nice -20`.
