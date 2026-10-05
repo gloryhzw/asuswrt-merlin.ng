@@ -373,7 +373,8 @@ static u64 notrace arm64_858921_read_cntvct_el0(void)
 #define B53_HIST_BUCKETS	18		/* fls64(1 .. 79999) = 1 .. 17 */
 #define B53_LARGE_CLAMP		1024ULL		/* ring buffer split: 12.8us */
 #define B53_RING_SIZE		8
-#define B53_REF_TOL		2000LL		/* 25us: ref read stalls (<= 10us) + slack */
+#define B53_REF_TOL		2000LL		/* 25us */
+#define B53_REF_BRACKET		64ULL		/* max arch ticks around one ref read (0.8us) */
 #define B53_HB_PERIOD_US	10000UL		/* heartbeat: 10ms */
 #define B53_REF_PERIOD_US	(0x3FFFFFFFFFFFFFFFULL / 200)	/* never wraps */
 #define B53_REF_CNT_PHYS	0xff800420UL	/* TimerCnt0; TimerCntN at +8*N */
@@ -414,6 +415,7 @@ static u32 b53_ref_mul;			/* arch ticks per ref tick, Q32 */
 static seqcount_t b53_anchor_seq;
 static u64 b53_anchor_arch, b53_anchor_ref;	/* true arch time <-> ref */
 static bool b53_rearm_pending;
+static bool b53_cal_dirty;			/* b53_comp changed: skip this rate window */
 static DEFINE_PER_CPU(struct irq_work, b53_rearm_work);
 
 /* A correction of b53_comp: raw view, compensation before, error, source. */
@@ -479,24 +481,46 @@ static __always_inline u64 b53_read_pair(bool virt, unsigned long *unstable)
 	return b;
 }
 
-static __always_inline u64 b53_ref_read(void)
+/*
+ * One reference reading paired with the arch view at the same moment. The
+ * MMIO read can stall for tens of microseconds on a busy bus, which would
+ * pair the ref with the wrong arch time (always in the same direction, so
+ * the error would build up), so the ref read is bracketed by two arch reads
+ * and only used if the whole thing took less than B53_REF_BRACKET.
+ */
+static __always_inline bool b53_ref_sample(u64 *arch, u64 *ref)
 {
-	return readq_relaxed(b53_ref_cnt) & B53_REF_CNT_MASK;
+	int i;
+
+	for (i = 0; i < 4; i++) {
+		u64 a0, a1, r;
+
+		isb();
+		a0 = b53_read_raw(false);
+		r = readq(b53_ref_cnt) & B53_REF_CNT_MASK;
+		isb();
+		a1 = b53_read_raw(false);
+		if (a1 - a0 < B53_REF_BRACKET) {
+			*arch = a0 + (a1 - a0) / 2;
+			*ref = r;
+			return true;
+		}
+	}
+	return false;
 }
 
-/* True arch time now, according to the reference timer; *age = ref ticks
- * since the anchor (the tolerance grows with it). */
-static __always_inline u64 b53_ref_expect(u64 *age)
+/* True (compensated) arch time at reference value r, from the anchor;
+ * *age = ref ticks since the anchor (the tolerance grows with it). */
+static __always_inline u64 b53_ref_expect(u64 r, u64 *age)
 {
 	unsigned int seq;
-	u64 a0, r0, r;
+	u64 a0, r0;
 
 	do {
 		seq = raw_read_seqcount_begin(&b53_anchor_seq);
 		a0 = b53_anchor_arch;
 		r0 = b53_anchor_ref;
 	} while (read_seqcount_retry(&b53_anchor_seq, seq));
-	r = b53_ref_read();
 	*age = r - r0;
 	return a0 + mul_u64_u32_shr(r - r0, b53_ref_mul, 32);
 }
@@ -513,6 +537,7 @@ static __always_inline void b53_comp_fix(s64 old, s64 delta, u64 raw, char src)
 	f->comp = old;
 	f->err = -delta;
 	f->src = src;
+	WRITE_ONCE(b53_cal_dirty, true);
 	WRITE_ONCE(b53_rearm_pending, true);
 }
 
@@ -540,14 +565,17 @@ static __always_inline u64 b53_read_counter(bool virt)
 		st->rejected++;
 
 	if (READ_ONCE(b53_ref_ready)) {
-		u64 age, expect = b53_ref_expect(&age);
-		s64 err = cur - expect;
+		u64 a, r, age;
 
-		st->ref_checked++;
-		if (abs(err) > B53_REF_TOL + (s64)(age >> 12)) {
-			/* the counter view is offset by err: take it back out */
-			b53_comp_fix(comp, -err, cur - comp, 'r');
-			cur -= err;
+		if (b53_ref_sample(&a, &r)) {
+			s64 err = (s64)(a + comp - b53_ref_expect(r, &age));
+
+			st->ref_checked++;
+			if (abs(err) > B53_REF_TOL + (s64)(age >> 12)) {
+				/* the counter view is offset by err: take it back out */
+				b53_comp_fix(comp, -err, a, 'r');
+				cur -= err;
+			}
 		}
 	}
 
@@ -668,8 +696,6 @@ static void b53_heartbeat(unsigned long unused)
 {
 	static s64 pending_err;
 	static u64 cal_arch, cal_ref;
-	static bool cal_dirty;
-	unsigned long unstable = 0;
 	s64 comp, err;
 	u64 raw, cur, r, age, expect, now;
 
@@ -677,10 +703,10 @@ static void b53_heartbeat(unsigned long unused)
 		return;
 	b53_hb_beats++;
 	comp = READ_ONCE(b53_comp);
-	raw = b53_read_pair(false, &unstable);
+	if (!b53_ref_sample(&raw, &r))
+		return;			/* bus too slow this time; next beat */
 	cur = raw + comp;
-	expect = b53_ref_expect(&age);
-	r = b53_anchor_ref + age;
+	expect = b53_ref_expect(r, &age);
 	err = cur - expect;
 	now = cur;
 
@@ -691,7 +717,6 @@ static void b53_heartbeat(unsigned long unused)
 			b53_comp_fix(comp, -err, raw, 'h');
 			now = expect;
 			pending_err = 0;
-			cal_dirty = true;
 		} else {
 			pending_err = err;	/* confirm on the next beat */
 			now = expect;
@@ -710,14 +735,14 @@ static void b53_heartbeat(unsigned long unused)
 
 	/* refine the ref rate every ~1s (the clocks differ and wander) */
 	if (r - cal_ref >= 200000000ULL) {
-		if (cal_ref && !cal_dirty) {
+		if (cal_ref && !READ_ONCE(b53_cal_dirty)) {
 			u64 mul = div64_u64((now - cal_arch) << 32, r - cal_ref);
 
 			b53_ref_mul = b53_ref_mul - (b53_ref_mul >> 3) + (u32)(mul >> 3);
 		}
 		cal_arch = now;
 		cal_ref = r;
-		cal_dirty = false;
+		WRITE_ONCE(b53_cal_dirty, false);
 	}
 }
 
@@ -872,16 +897,17 @@ static void __init b53_ref_init(void)
 	}
 
 	/* initial rate: 100ms, refined by the heartbeat afterwards */
-	a0 = arch_counter_get_cntpct();
-	r0 = b53_ref_read();
+	while (!b53_ref_sample(&a0, &r0))
+		cpu_relax();
 	msleep(100);
-	a1 = arch_counter_get_cntpct();
-	r1 = b53_ref_read();
+	while (!b53_ref_sample(&a1, &r1))
+		cpu_relax();
 	b53_ref_mul = (u32)div64_u64((a1 - a0) << 32, r1 - r0);
 
 	write_seqcount_begin(&b53_anchor_seq);
-	b53_anchor_arch = arch_counter_get_cntpct();
-	b53_anchor_ref = b53_ref_read();
+	while (!b53_ref_sample(&b53_anchor_arch, &b53_anchor_ref))
+		cpu_relax();
+	b53_anchor_arch += READ_ONCE(b53_comp);
 	write_seqcount_end(&b53_anchor_seq);
 	WRITE_ONCE(b53_ref_ready, true);
 
