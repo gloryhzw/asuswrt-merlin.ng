@@ -21,70 +21,74 @@ https://github.com/RMerl/asuswrt-merlin.ng/wiki/Supported-Devices
 RT-BE92U / Broadcom Brahma-B53 Timer Errata & Fixes
 ---------------------------------------------------
 
-This fork contains the independent discovery, comprehensive root-cause analysis, and bespoke kernel-level fixes for two critical hardware silicon errata in the **Broadcom Brahma-B53** CPU core (used in BCM6765, BCM4908, BCM4916, and related high-performance Wi-Fi 7 / Wi-Fi 6 router SoCs).
+This fork contains the independent discovery, root-cause analysis, and kernel-level fixes for a system counter erratum in the **Broadcom Brahma-B53** CPU core, as found on the **Asus RT-BE92U** (kernel 4.19, `release/src-rt-5.04behnd.4916`), plus the watchdog and scheduler changes made while chasing the resulting reboots.
 
-> **Note:** These hardware errata were **independently discovered, analyzed, and resolved by this project (`gloryhzw`)**. They are neither documented nor resolved in Broadcom's official SDK/reference code, nor in upstream Linux.
+> **Note:** This erratum was **independently discovered, analyzed, and worked around by this project (`gloryhzw`)**. It is neither documented nor handled in Broadcom's SDK/reference code, nor in upstream Linux (upstream knows the Brahma-B53 MIDR only for Spectre/KPTI whitelists, not for any timer workaround).
 
-### 1. The Hardware Errata
+### 1. The Hardware Erratum
 
-#### Erratum 1: Asynchronous Ripple-Carry Counter Glitch & Sched Clock Underflow
-The Brahma-B53 architectural system counter (`cntpct_el0` / `cntvct_el0`) uses an internal asynchronous ripple-carry counter design. During carry propagation across bit stages, counter reads can transiently glitch and read lower values. 
+#### Measured: counter reads that go backwards
+Reads of the 80 MHz architectural system counter (`cntpct_el0` / `cntvct_el0`) occasionally return a value **behind the previous read**. Measured on the RT-BE92U with `test_b53_bidir` and `b53_timer_test` (unfiltered kernel):
 
-Furthermore, cross-core skew between CPU cores during periodic `sched_clock` epoch updates causes unsigned 56-bit modular cycle underflows (~28.5-year jumps into the future). This triggers Linux scheduler real-time (RT) budget throttling and eventual hardware watchdog reboot loops.
+- Drop sizes of **-5 to -239 ticks** (60 ns to ~3 µs); the large majority are under 80 ticks.
+- Roughly 1 in 40,000 to 1 in 200,000 reads when all 4 cores read in a tight loop.
+- All cores see **the same bad value at the same moment** (e.g. `0x3e3ab847a -> 0x3e3ab842b` on cores 0 and 1), so it is the shared counter, not per-core skew.
+- The suspected mechanism is an asynchronous ripple-carry counter whose low bits are briefly read before a carry has settled. This is a hypothesis consistent with the data, not a confirmed silicon description.
 
-#### Erratum 2: Timer Down-Counter Silicon TVAL Addition Glitch (`CNTP_TVAL_EL0`)
-In stock Linux on ARM64, the high-resolution timer (`hrtimer`) subsystem programs one-shot timer events by writing the requested delta into the 32-bit signed timer value register `CNTP_TVAL_EL0`. In Brahma-B53 silicon, writing to `TVAL` causes the CPU hardware to automatically compute:
+#### Why a tiny glitch reboots the router
+Linux assumes the counter never goes backwards. A drop of even 1 tick produces a huge unsigned delta in code that does `(now - last) & mask`:
 
-$$\text{CVAL} = \text{Raw\_Counter} + \text{TVAL}$$
+- `sched_clock()` computes `(cyc - epoch_cyc) & 56-bit mask`. A negative delta becomes ~2^56 ticks (~28.5 years), which trips RT throttling and stalls the scheduler.
+- Without `CONFIG_CLOCKSOURCE_VALIDATE_LAST_CYCLE`, `clocksource_delta()` has the same problem in timekeeping.
 
-internally in silicon using an un-filtered hardware adder connected directly to the raw ripple counter.
+The end result observed in crash logs was CPU 0 stalling, `wdtd` not petting `/dev/watchdog`, and a hardware watchdog reset (`BOOT REASON WATCHDOG 0x3424`).
 
-If software writes to `TVAL` at the exact clock cycle where an internal carry ripple is propagating across the physical counter, the hardware computes `CVAL` with a corrupted counter state far into the future. When this occurs, the hardware timer interrupt (`CNTP_CTL_EL0` condition $\text{Raw\_Counter} \ge \text{CVAL}$) fails to fire at the scheduled time. Sleeping threads—such as the userspace watchdog feeder daemon `wdtd` inside `clock_nanosleep()`—become stranded in uninterruptible sleep, triggering an unrecoverable hardware watchdog reboot.
+#### Not measured: large glitches and forward spikes
+Earlier analysis assumed glitches could also be large (a carry into bit 20, 32 or 44, i.e. 13 ms, 53.7 s or days) or **forward** (+53.7 s for bit 32), and that the TVAL hardware adder (`CVAL = counter + TVAL`) could latch such a value and push a timer far into the future. **None of this has been observed.** The 0.6 to 13 ms "forward glitches" reported by `test_b53_bidir` are gaps where the test thread was preempted (its threshold flags any gap over 625 µs, and no matching backward correction ever follows). The current filter still defends against large glitches in both directions, because doing so costs almost nothing.
 
-### 2. The Bespoke Kernel Fixes
+### 2. The Kernel Fixes
 
-1. **Spike-Rejection Verified Counter Filter (`arm_arch_timer.c`)**:
-   - Solves both physical counter ripple drops and transient high-order carry spikes (such as bit 32 = +53.68s) without lock contention or clock freeze:
-   - **Monotonicity (Negative Drops)**: Any backward drop within `B53_RIPPLE_DROP_THRESHOLD` (12.5ms / ~1M ticks) is clamped to `prev`, providing 100% strict monotonicity on each CPU with **0 glitches** detected across hundreds of millions of reads.
-   - **Forward Spike Rejection (Anti-Poisoning)**: Any forward jump exceeding `B53_SPIKE_VERIFY_THRESHOLD` (1ms / 80k ticks) is immediately verified against a second read following an `isb()` pipeline flush. If the second read drops back, the reading was an incomplete forward carry spike (which physically dissipates in nanoseconds) and is rejected before it can ever be stored in `last` or programmed into `cval`.
-   - **Zero Cross-Core Contention**: Uses `DEFINE_PER_CPU` so each CPU executes in local L1 cache with zero locks and zero cache bouncing. Seamlessly handles counter rollover without deadlock.
+1. **Pair-verified counter filter (`drivers/clocksource/arm_arch_timer.c`)**:
+   Hooked through the arm64 out-of-line timer erratum framework (`ARM64_WORKAROUND_B53_TIMER`, matched on the Brahma-B53 MIDR), so every kernel read, `sched_clock()` and every userspace `mrs cntvct_el0` (trapped) goes through it. Each CPU remembers the last value it returned:
+   - **Forward step < 1 ms**: normal case, returned as-is.
+   - **Backward step < 1 ms**: a read glitch. The previous value is returned again, so the clock holds for a few ticks instead of going backwards.
+   - **Any larger jump, either direction** (first read on a CPU, wake from idle, or a large glitch): the value is re-read until two back-to-back reads agree (in order, within 12.8 µs). A single bad read is therefore never returned, stored, or used to program a timer. If the agreed value is still ≥ 1 ms behind the stored one, the stored value was the bad one and the CPU resyncs to the counter.
+   - **Diagnostics**: per-CPU counts of each path are exposed in `/proc/b53_timer` (`clamped`, `checked`, `rejected`, `resynced`, `unstable`). This replaces inference with data: a non-zero `rejected` would be the first evidence of a large glitch.
+   - Per-CPU state with no locks or shared cache lines. The fast path adds a compare and a store to each read; the read path makes no function calls (safe for `notrace` / `sched_clock`).
 
-2. **Scheduler Clock Underflow Protection (`sched_clock.c`)**:
-   - Protects `sched_clock()` and `update_sched_clock()` against cross-core epoch skew by clamping negative cycle deltas to zero, preventing 28.5-year scheduler budget underflows.
+2. **Timer programming via CVAL (`drivers/clocksource/arm_arch_timer.c`)**:
+   `.set_next_event_phys/virt` use the framework's `erratum_set_next_event_tval_*`, which computes `CVAL = filtered counter + delta` in software and writes `cntp_cval_el0`/`cntv_cval_el0`, instead of writing `TVAL` and letting hardware add it to a possibly glitched counter. With measured glitch sizes the error from `TVAL` would be ≤ 3 µs, so this is defensive.
 
-3. **Timekeeping Last-Cycle Validation (`Kconfig`)**:
-   - Selects `CONFIG_CLOCKSOURCE_VALIDATE_LAST_CYCLE` on ARM64 for robust kernel timekeeping.
+3. **Scheduler clock underflow guard (`kernel/time/sched_clock.c`)**:
+   - `sched_clock()` treats a negative delta against the epoch as 0 instead of ~28.5 years.
+   - `update_sched_clock()` **keeps the old epoch** when its reading is behind it. (Kernel #17 set `epoch_cyc` to the low reading while keeping `epoch_ns`, which would make `sched_clock()` jump forward by the size of the drop.)
 
-4. **Timer Programming Silicon TVAL Bypass (`arm_arch_timer.c`)**:
-   - Hooks `.set_next_event_phys` and `.set_next_event_virt` to bespoke erratum handlers `erratum_set_next_event_tval_phys/virt`.
-   - Bypasses the CPU silicon's buggy un-filtered hardware adder entirely: software calculates:
-     $$\text{CVAL} = \text{Filtered\_Counter} + \text{evt}$$
-     using the Spike-Rejection Verified Counter Filter and writes directly to `cntp_cval_el0`, completely immunizing the system against missed timer interrupts caused by carry ripple during timer programming.
+4. **Timekeeping last-cycle validation (`arch/arm64/Kconfig`)**:
+   Selects `CONFIG_CLOCKSOURCE_VALIDATE_LAST_CYCLE` so `clocksource_delta()` clamps negative deltas to 0.
 
-5. **Watchdog Panic Governor & Microsecond Logging (`config_base.6a.6765`)**:
-   - Enables `CONFIG_WATCHDOG_PRETIMEOUT_GOV_PANIC=y` so that watchdog pre-timeouts trigger a kernel panic backtrace to preserve crash context in memory and NVRAM rather than silent hardware resets.
-   - Enables `CONFIG_PRINTK_TIME=y` and `BCM_PRINTK_TIME=y` for microsecond-precision timestamps.
+5. **Watchdog panic governor & printk timestamps (`config_base.6a.6765`)**:
+   - `CONFIG_WATCHDOG_PRETIMEOUT_GOV_PANIC=y` and `CONFIG_WATCHDOG_PRETIMEOUT_DEFAULT_GOV_PANIC=y`: a watchdog pretimeout panics and leaves a backtrace (dumped to flash by `mtdoops`) instead of a silent reset.
+   - `CONFIG_PRINTK_TIME=y` for microsecond timestamps in `dmesg`.
 
-6. **Watchdog Pretimeout Multi-Core Interrupt Affinity Routing (`/proc/irq/41/smp_affinity`)**:
-   - On Broadcom BCA platforms, CPU 0 bears 100% of the system infrastructure load (switch packet queues `crossbow_rxq/txq`, packet bridge `br0`, memory buffer recycling `bcmsw_recycle`, eMMC flash, and console), while CPUs 1–3 exclusively service PCIe wireless radios.
-   - Under standard ARM GICv2 SPI routing, unpinned hardware interrupts target the lowest core (CPU 0). Consequently, the hardware watchdog pretimeout interrupt (IRQ 41, `ff800480.watchdog`) was routed strictly to CPU 0.
-   - If CPU 0 encounters a hard lockup with local interrupts disabled (`local_irq_disable` / `spin_lock_irqsave`), CPU 0 cannot take IRQ 41. This bypassed `watchdog_notify_pretimeout()`, silenced the panic handler, and prevented `mtdoops` from dumping crash logs to `/dev/mtd12` before the ASIC watchdog counter reached zero (`BOOT REASON WATCHDOG 0x3424`).
-   - While routing strictly to CPU 3 was initially trialed, CPU 3 is heavily loaded by 6GHz Wi-Fi (`wl2`, >400k IRQs) and Broadcom IPC sockets (`crossbow_socket`, >450k IRQs), making it susceptible to cross-core `spin_lock_irqsave` lock contention when communicating with CPU 0.
-   - **Remediation**: Explicitly route IRQ 41 affinity to all non-CPU0 cores (**CPUs 1–3**, `smp_affinity: e`) in startup scripts (`init-start` / `services-start`). Under GICv2 1-of-N SPI distribution, if CPU 0 or CPU 3 is trapped in a spinlock with interrupts disabled, any surviving core (CPU 1 or CPU 2) immediately intercepts the pretimeout event at 57 seconds, triggers `panic()`, and preserves the complete `dmesg` buffer and CPU status to flash.
+6. **Watchdog pretimeout interrupt affinity (`/proc/irq/41/smp_affinity`, startup script)**:
+   - On Broadcom BCA platforms CPU 0 carries the switch packet queues (`crossbow_rxq/txq`), bridge `br0`, buffer recycling `bcmsw_recycle`, eMMC and console, while CPUs 1–3 mostly service the PCIe radios.
+   - Unpinned SPIs land on CPU 0, so the watchdog pretimeout interrupt (IRQ 41, `ff800480.watchdog`) went to CPU 0. If CPU 0 hard-locks with interrupts disabled, it cannot take IRQ 41: `watchdog_notify_pretimeout()` never runs, nothing is dumped, and the ASIC watchdog resets the board.
+   - Routing only to CPU 3 was tried, but CPU 3 is heavily loaded by 6 GHz Wi-Fi (`wl2`) and `crossbow_socket` IRQs.
+   - **Remediation**: route IRQ 41 to CPUs 1–3 (`smp_affinity: e`) in `/jffs/scripts/init-start`. Any surviving core can take the pretimeout at 57 s, panic, and preserve the log.
 
-7. **Scheduler Real-Time (RT) Throttling Disablement & Watchdog Priority Normalization**:
-   - **Forensic Diagnosis of CPU 0 Lockup**:
-     - *RCU Grace-Period Starvation*: Kernel crash dumps showed `rcu: rcu_sched kthread starved for 15023 jiffies! ... ->state=0x402 ->cpu=0`, proving CPU 0 was trapped inside kernel execution without scheduling (`cond_resched()`) or with preemption/interrupts disabled for over 15 seconds.
-     - *Real-Time Network Thread Congestion*: Broadcom's Ethernet switch recycle thread (`bcmsw_recycle`, PID 535) is pinned to CPU 0 at `SCHED_FIFO 75`. Under high packet recycling and buffer management, it executes inside `spin_lock_irqsave(&crossbow_enet_g.rx_lock, flags)`.
-     - *RT Bandwidth Throttling*: The default kernel parameter `/proc/sys/kernel/sched_rt_runtime_us = 950000` tripped `sched: RT throttling activated`. Because the watchdog daemon (`wdtd`) was configured by default as real-time `SCHED_FIFO 98`, the RT throttle group suspended all RT tasks on the core, preventing `wdtd` from kicking `/dev/watchdog` within the 60-second window.
-     - *The `-30` (`BCME_NOTFOUND`) Red Herring*: Earlier casual inspection of crash logs suggested `WLC_SCB_DEAUTHORIZE error (-30)` triggered the reboot. Rigorous kernel timestamp analysis proved this was a correlation fallacy: `-30` occurred >68 minutes (4,079 seconds) prior to the panic. It is an innocuous Broadcom wireless SDK status (`#define BCME_NOTFOUND -30`) indicating that a departing station's Station Control Block had already aged out.
-   - **Remediation**:
-     - Set `/proc/sys/kernel/sched_rt_runtime_us` to `-1` (disabling RT throttling entirely).
-     - Re-normalized `wdtd` / `wdtctl` scheduling policy from `SCHED_FIFO 98` to `SCHED_OTHER` with maximum non-RT priority (`nice -20`). This completely decouples watchdog petting from the real-time throttle group while guaranteeing high scheduling priority without starving system threads.
+7. **RT throttling disabled & watchdog daemon priority (startup script)**:
+   - **Diagnosis of the CPU 0 lockup**:
+     - *RCU starvation*: crash dumps showed `rcu: rcu_sched kthread starved for 15023 jiffies! ... ->cpu=0`, i.e. CPU 0 did not schedule for over 15 s.
+     - *RT network thread*: `bcmsw_recycle` (PID 535) runs on CPU 0 at `SCHED_FIFO 75` and spends time inside `spin_lock_irqsave(&crossbow_enet_g.rx_lock, flags)`.
+     - *RT throttling*: with `sched_rt_runtime_us = 950000`, `sched: RT throttling activated` suspended all RT tasks on the core, including `wdtd` at `SCHED_FIFO 98`, so it missed the 60 s watchdog window.
+     - *The `-30` red herring*: `WLC_SCB_DEAUTHORIZE error (-30)` (`BCME_NOTFOUND`, a station that already aged out) appeared in crash logs but occurred 4,079 s before the panic and is unrelated.
+   - **Remediation** (`/jffs/scripts/services-start`):
+     - `/proc/sys/kernel/sched_rt_runtime_us = -1` (RT throttling disabled).
+     - `wdtd` / `wdtctl` moved from `SCHED_FIFO 98` to `SCHED_OTHER` at `nice -20`, so watchdog petting no longer depends on the RT throttle group.
 
 ### 3. Validation Suite: `b53_bench`
 
-A dedicated bare-metal C test suite ([`b53_bench.c`](https://github.com/gloryhzw/asuswrt-merlin.ng/releases/download/0.99/b53_bench.c)) was authored to validate Brahma-B53 timer monotonicity, cross-core skew, and TVAL bypass stability under live SMP loads.
+A dedicated C test suite ([`b53_bench.c`](https://github.com/gloryhzw/asuswrt-merlin.ng/releases/download/0.99/b53_bench.c)) checks counter monotonicity, cross-core consistency, and timer behaviour under SMP load.
 
 #### Test Coverage
 - **Test 1: Hardware Counter Core-to-Core Skew**: Pins workers to cores 0 and 1; reads `cntvct_el0` millions of times to detect backward skew and 56-bit underflows.
@@ -92,11 +96,13 @@ A dedicated bare-metal C test suite ([`b53_bench.c`](https://github.com/gloryhzw
 - **Test 3: High-Contention Syscall Cross-Core Flood**: Causal verification of `SYS_clock_gettime` across all 4 cores with memory barrier acquire/release semantics.
 - **Test 4: High-Res Timer (`timerfd`) Precision**: Sub-millisecond periodic timers (250 µs, 500 µs, 1 ms, 2 ms) verifying zero premature expirations and bounded jitter.
 - **Test 5: Multi-Clock Domain Consistency**: Validates monotonic relationship across `CLOCK_MONOTONIC`, `CLOCK_MONOTONIC_RAW`, and `CLOCK_BOOTTIME`, plus NTP frequency slew bounds.
-- **Test 6: Clock Latency & Throughput Benchmark**: Measures calls/sec and nanosecond latency for all major POSIX clocks and raw `mrs cntvct_el0`.
-- **Test 7: Timer Programming & Silicon TVAL Bypass Stress**: Concurrently hammers `clock_nanosleep()` across all 4 CPU cores using `CLOCK_REALTIME` and `CLOCK_MONOTONIC` to ensure zero missed or delayed (>50 ms) timer wakeups.
+- **Test 6: Clock Latency & Throughput Benchmark**: Measures calls/sec and nanosecond latency for all major POSIX clocks and `mrs cntvct_el0`.
+- **Test 7: Timer Programming Stress**: Concurrently hammers `clock_nanosleep()` across all 4 CPU cores using `CLOCK_REALTIME` and `CLOCK_MONOTONIC` to ensure zero missed or delayed (>50 ms) timer wakeups.
+
+> Because the kernel traps userspace `cntvct_el0` reads on this CPU, `mrs cntvct_el0` in these tests (and the "RAW" mode of `b53_timer_test`) measures the **filtered** value userspace sees, not the raw hardware counter.
 
 #### Running `b53_bench` on the Router
-A statically linked aarch64 binary is available for download in [Release 0.99](https://github.com/gloryhzw/asuswrt-merlin.ng/releases/tag/0.99):
+A statically linked aarch64 binary is available in [Release 0.99](https://github.com/gloryhzw/asuswrt-merlin.ng/releases/tag/0.99):
 
 ```sh
 # Download and execute on the router
@@ -107,60 +113,38 @@ chmod +x /tmp/b53_bench
 /tmp/b53_bench -a 3
 ```
 
-### 4. Verification & Live Operational Results
+### 4. Kernel History & Results
 
-- **Long-term Monotonicity & Roll-over (Kernel #13)**: Validated continuous operation exceeding **16 continuous days (almost 384 hours, 1,381,758 seconds)** on the **Asus RT-BE92U** under heavy live home routing traffic with zero clock regressions, zero lock contention, and zero rollover deadlocks.
-- **Kernel #14 Analysis & The Positive Carry Glitch Discovery**:
-  - Kernel #14 introduced TVAL bypass, reprogramming timers via software counter reads >200M times/day.
-  - However, Kernel #14 clamped only backward deltas in software state (`b53_last_cntpct`). When transient forward carry spikes occurred (e.g. bit 32 = +53.68s, bit 33 = +107.37s during ripple cascade transitions), the future timestamp latched into `b53_last_cntpct`, freezing the core's clock until physical time caught up and triggering hardware watchdog resets every 30–78 hours.
-- **Kernel #15 / #16 Analysis (The Limits of Stateless Filters)**:
-  - While stateless double-read filters avoided forward state latching, asynchronous ripple glitches on BCM4916 Brahma-B53 span higher bit stages (up to 239+ ticks). Because the physical carry ripple duration can exceed the pipeline interval between consecutive reads, stateless filters allowed physical drops to leak into userspace (causing `b53_timer_test` to report glitches).
-- **Kernel #17 (Spike-Rejection Verified Counter Filter)**:
-  - Combines per-CPU local monotonic clamping (`B53_RIPPLE_DROP_THRESHOLD = 12.5ms`) with forward carry spike verification (`B53_SPIKE_VERIFY_THRESHOLD = 1ms`).
-  - Clamps all physical ripple drops for 100% strict monotonicity, while instantly catching and discarding forward carry spikes (like bit 32 = +53.68s) via pipeline-flushed secondary confirmation, completely preventing `cval` timer poisoning.
-  - **Live Verification on Asus RT-BE92U (`b53_timer_test` RAW mode)**:
-    - Over **186.3 million** direct reads across 4 cores: **0 glitches (0.00000%)** -> **100% PASS**!
-  - **Live Verification on Asus RT-BE92U (`b53_bench -a 3`)**:
-    - Over **13.6 million** inter-core reads: **0 underflows**, max core skew bounded to 0.625 µs.
-    - Over **13.7 million** cross-core syscall checks at **4.57 Mops**: **0 underflow crashes**, bounded to < 2 µs.
-    - Over **29,000** timer reprogrammings across all 4 cores at **9,685 events/sec**: **0 missed timer interrupts**, **0 delayed wakeups**, **0 premature firings**.
-    - All 7 validation tests pass with 100% success.
+- **Kernel #13 (full backward clamp)**: ran **16 days (1,381,758 s)** on the RT-BE92U under normal home traffic without a reboot.
+- **Kernel #14 (+ CVAL timer programming)**: watchdog resets every 30–78 hours. The explanation at the time was a forward spike being stored as the last value and freezing the clock; since no forward spike has ever been measured, **the cause of these resets is unconfirmed**. The IRQ 41 affinity and RT throttling changes (fixes 6 and 7) were made in the same period.
+- **Kernel #15 / #16 (stateless double-read)**: comparing two consecutive reads within 32 ticks let 81–239 tick drops through, because both reads can land in the same glitch. Per-CPU state is required.
+- **Kernel #17 (12.5 ms clamp + forward spike check)**: `b53_timer_test` 186.3 M reads with **0 glitches**; `b53_bench -a 3` all 7 tests pass (13.6 M inter-core reads with 0 underflows; 13.7 M syscall checks at 4.57 Mops; 29,000+ timer reprogrammings with 0 missed or delayed wakeups). Two weaknesses: any drop of 12.5 ms or more was returned as a "rollover" (the counter cannot roll over for ~28 years), and `update_sched_clock()` could move the epoch backwards.
+- **Kernel #18 (pair-verified filter, this revision)**: fixes both weaknesses and adds `/proc/b53_timer`. **Status: not yet built or run on hardware.** Treat it as proven only after more than 7 days of uptime (well past #14's 30–78 h failure window) with `resynced` and `unstable` at 0.
 
 ### 5. Key File Locations & Source Code Map
 
-All key patches, test suites, and automation tools are organized across the workspace and router filesystem:
+#### A. Kernel source (under [`release/src-rt-5.04behnd.4916/kernel/linux-4.19/`](release/src-rt-5.04behnd.4916/kernel/linux-4.19/))
+- **Counter filter, CVAL timer programming, `/proc/b53_timer`**:
+  [`drivers/clocksource/arm_arch_timer.c`](release/src-rt-5.04behnd.4916/kernel/linux-4.19/drivers/clocksource/arm_arch_timer.c) — `b53_read_counter`, `b53_read_pair`, `b53_read_cntpct_el0` / `b53_read_cntvct_el0`, and the `ool_workarounds[]` entry.
+- **Erratum capability & CPU match**:
+  [`arch/arm64/kernel/cpu_errata.c`](release/src-rt-5.04behnd.4916/kernel/linux-4.19/arch/arm64/kernel/cpu_errata.c), [`arch/arm64/include/asm/cpucaps.h`](release/src-rt-5.04behnd.4916/kernel/linux-4.19/arch/arm64/include/asm/cpucaps.h), [`arch/arm64/include/asm/cputype.h`](release/src-rt-5.04behnd.4916/kernel/linux-4.19/arch/arm64/include/asm/cputype.h) — `ARM64_WORKAROUND_B53_TIMER`, `MIDR_BRAHMA_B53`. ([`arch/arm64/kernel/cpufeature.c`](release/src-rt-5.04behnd.4916/kernel/linux-4.19/arch/arm64/kernel/cpufeature.c) adds the B53 to the KPTI safe list.)
+- **Scheduler clock guard**:
+  [`kernel/time/sched_clock.c`](release/src-rt-5.04behnd.4916/kernel/linux-4.19/kernel/time/sched_clock.c) — negative-delta clamp and epoch hold.
+- **Timekeeping validation**:
+  [`arch/arm64/Kconfig`](release/src-rt-5.04behnd.4916/kernel/linux-4.19/arch/arm64/Kconfig) — selects `CONFIG_CLOCKSOURCE_VALIDATE_LAST_CYCLE`.
+- **Kernel config for this platform**:
+  [`config_base.6a.6765`](release/src-rt-5.04behnd.4916/kernel/linux-4.19/config_base.6a.6765) — watchdog pretimeout panic governor and `CONFIG_PRINTK_TIME`. (The panic governor itself is the stock `drivers/watchdog/pretimeout_panic.c`, only enabled here.)
 
-#### A. Kernel Source Code Patches (in `release/src-rt-5.04behnd.4916/kernel/linux-4.19/`)
-- **Timer Counter Filter & Silicon TVAL Bypass**:
-  [`drivers/clocksource/arm_arch_timer.c`](drivers/clocksource/arm_arch_timer.c) — Contains `b53_read_cntpct_el0`, `b53_read_cntvct_el0`, and `erratum_set_next_event_tval_phys/virt`.
-- **Scheduler Clock Guard**:
-  [`kernel/time/sched_clock.c`](kernel/time/sched_clock.c) — Epoch delta clamping against 28.5-year underflow.
-- **Timekeeping Validation Kconfig**:
-  [`arch/arm64/Kconfig`](arch/arm64/Kconfig) — Enables `CONFIG_CLOCKSOURCE_VALIDATE_LAST_CYCLE=y`.
-- **Userspace vDSO Monotonic Clamp**:
-  [`arch/arm64/kernel/vdso/gettimeofday.S`](arch/arm64/kernel/vdso/gettimeofday.S) — Assembly sign-bit clamp for virtual counter delta.
-- **Watchdog Panic Governor**:
-  [`drivers/watchdog/pretimeout_panic.c`](drivers/watchdog/pretimeout_panic.c) — Kernel panic handler on watchdog pretimeout.
-- **Kernel Platform Defconfig**:
-  [`arch/arm64/configs/bcm96765_defconfig`](arch/arm64/configs/bcm96765_defconfig) — Microsecond printk timestamps and pretimeout panic governor options.
+#### B. Validation & test tools (local build host, not in this repo)
+- `/home/glory/b53_bench.c` — 7-test benchmark source; deployed on the router as `/jffs/b53_bench`.
+- `/home/glory/merlin/test_b53_bidir.c` — backward/forward glitch logger (the forward column counts preemption gaps; see section 1).
+- `/home/glory/merlin/b53_timer_test` — multi-core glitch detector; deployed as `/jffs/b53_timer_test`.
 
-#### B. Validation & Test Suites
-- **Unified Erratum & Clock Benchmark**:
-  [`/home/glory/b53_bench.c`](file:///home/glory/b53_bench.c) — Bare-metal 7-suite C benchmark (source). Deployed on router at `/jffs/b53_bench`.
-- **Hardware Timer Glitch Detector**:
-  Native multi-core RAW instruction reader binary deployed on router at `/jffs/b53_timer_test`.
+#### C. Build & flashing tools (local build host, not in this repo)
+- `/home/glory/merlin/setup_env.sh` — toolchain paths and the `build_be92u` helper (build as user `glory`, never root).
+- `/home/glory/upload_firmware.py` — Asuswrt Login v2 Web UI firmware flasher.
+- `/home/glory/check_router_time.sh` — hourly cron check for router reboots, sending ntfy alerts.
 
-#### C. Build & Flashing Tools
-- **Environment Setup**:
-  [`/home/glory/merlin/setup_env.sh`](file:///home/glory/merlin/setup_env.sh) — Sets cross-compiler paths, automake shims, and defines `build_be92u`.
-- **Automated Web UI Flasher**:
-  [`/home/glory/upload_firmware.py`](file:///home/glory/upload_firmware.py) — Python script for Asuswrt Login v2 HTTP streaming firmware upgrades.
-- **Hourly Cron Uptime Monitor**:
-  [`/home/glory/check_router_time.sh`](file:///home/glory/check_router_time.sh) — Verifies uptime and sends ntfy push alerts.
-
-#### D. Router Startup Scripts (Persistent in `/jffs/scripts/`)
-- **Watchdog Affinity & Microsecond Logging**:
-  `/jffs/scripts/init-start` — Routes IRQ 41 to CPUs 1–3 (`smp_affinity: e`) and enables `printk.time=Y`.
-- **RT Throttling Disablement & Daemon Priority**:
-  `/jffs/scripts/services-start` — Sets `sched_rt_runtime_us = -1` and sets `wdtd` to `nice -20`.
-
+#### D. Router startup scripts (persistent in `/jffs/scripts/`)
+- `/jffs/scripts/init-start` — routes IRQ 41 to CPUs 1–3 (`smp_affinity: e`) and enables `printk.time=Y`.
+- `/jffs/scripts/services-start` — sets `sched_rt_runtime_us = -1` and runs `wdtd` at `nice -20`.

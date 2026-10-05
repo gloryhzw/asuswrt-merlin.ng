@@ -153,8 +153,13 @@ static void update_sched_clock(void)
 
 	cyc = cd.actual_read_sched_clock();
 	delta = (cyc - rd.epoch_cyc) & rd.sched_clock_mask;
+	/*
+	 * Reading is behind the current epoch: keep the old epoch. Moving
+	 * epoch_cyc back while holding epoch_ns would make every later
+	 * sched_clock() jump forward by the size of the drop.
+	 */
 	if (unlikely(delta & ~(rd.sched_clock_mask >> 1)))
-		delta = 0;
+		return;
 	ns = rd.epoch_ns + cyc_to_ns(delta, rd.mult, rd.shift);
 
 	rd.epoch_ns = ns;

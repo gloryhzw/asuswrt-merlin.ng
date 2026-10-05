@@ -27,6 +27,8 @@
 #include <linux/sched/clock.h>
 #include <linux/sched_clock.h>
 #include <linux/acpi.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 
 #include <asm/arch_timer.h>
 #include <asm/virt.h>
@@ -321,101 +323,136 @@ static u64 notrace arm64_858921_read_cntvct_el0(void)
 #endif
 
 /*
- * Broadcom Brahma-B53 counter read erratum workaround:
- * The 80MHz system counter (cntpct_el0 / cntvct_el0) can glitch during carry
- * transitions across internal ripple counter stages.
+ * Broadcom Brahma-B53 counter read erratum workaround.
  *
- * 1. Monotonicity (Negative Drops):
- *    Any backward drop within B53_RIPPLE_DROP_THRESHOLD (12.5ms) is clamped
- *    to 'prev', guaranteeing 100% strict monotonicity on each CPU with zero
- *    glitches seen by userspace or kernel timekeeping.
+ * Reads of the 80MHz system counter (cntpct_el0 / cntvct_el0) occasionally
+ * return a value behind the previous read (measured on RT-BE92U: -5 to
+ * -239 ticks, i.e. < 3us). Every CPU sees the same bad values at the same
+ * time, so it is the shared counter itself.
  *
- * 2. Forward Spike Rejection (No Future Lockup / cval Poisoning):
- *    Any forward jump exceeding B53_SPIKE_VERIFY_THRESHOLD (1ms / 80k ticks)
- *    is immediately verified with a second reading after a pipeline flush (isb).
- *    If the second read drops back, the reading was an incomplete forward carry
- *    spike (e.g. bit 32 = +53.68s) and is discarded before it can ever be stored
- *    in 'last' or programmed into hardware cval, completely immunizing the system
- *    against clock freezes and watchdog reboots.
+ * Each CPU remembers the last value it handed out:
+ *
+ * 1. Forward step < B53_FAST_WINDOW: normal case, accept.
+ * 2. Backward step < B53_CLAMP_WINDOW: read glitch, return the last value
+ *    again (the clock holds for a few ticks instead of going backwards).
+ * 3. Anything larger, either direction (first read on a CPU, wake from idle,
+ *    or a large glitch): only trust a value that two back-to-back reads
+ *    agree on, so a single bad read can never be returned, stored as 'last',
+ *    or used to program cval. A confirmed value far behind 'last' means
+ *    'last' itself was bad, so resync to it instead of holding forever.
+ *
+ * Per-CPU counts of each path are reported in /proc/b53_timer.
  */
-#define B53_SPIKE_VERIFY_THRESHOLD	80000ULL	/* 1ms @ 80MHz */
-#define B53_RIPPLE_DROP_THRESHOLD	1000000ULL	/* 12.5ms @ 80MHz */
+#define B53_FAST_WINDOW		80000ULL	/* 1ms @ 80MHz */
+#define B53_CLAMP_WINDOW	80000ULL	/* 1ms @ 80MHz */
+#define B53_PAIR_WINDOW		1024ULL		/* 12.8us @ 80MHz */
+#define B53_PAIR_RETRIES	8
 
-static DEFINE_PER_CPU(u64, b53_last_cntpct);
-static DEFINE_PER_CPU(u64, b53_last_cntvct);
+struct b53_timer_state {
+	u64 last[2];			/* [0] = cntpct, [1] = cntvct */
+	unsigned long clamped;		/* small backward step held at last */
+	unsigned long checked;		/* large step re-read as a pair */
+	unsigned long rejected;		/* first read was >= 1ms off the pair */
+	unsigned long resynced;		/* pair >= 1ms behind last: last was bad */
+	unsigned long unstable;		/* no agreeing pair within retries */
+};
+
+static DEFINE_PER_CPU(struct b53_timer_state, b53_timer_state);
+
+static __always_inline u64 b53_read_raw(bool virt)
+{
+	return virt ? read_sysreg(cntvct_el0) : read_sysreg(cntpct_el0);
+}
+
+/* Read until two back-to-back reads are in order and within B53_PAIR_WINDOW. */
+static __always_inline u64 b53_read_pair(bool virt, struct b53_timer_state *st)
+{
+	u64 a, b;
+	int i;
+
+	isb();
+	a = b53_read_raw(virt);
+	b = a;
+	for (i = 0; i < B53_PAIR_RETRIES; i++) {
+		isb();
+		b = b53_read_raw(virt);
+		if (b - a < B53_PAIR_WINDOW)
+			return b;
+		a = b;
+	}
+	st->unstable++;
+	return b;
+}
+
+/* Called with preemption disabled (arch_timer_reg_read_stable). */
+static __always_inline u64 b53_read_counter(bool virt)
+{
+	struct b53_timer_state *st = raw_cpu_ptr(&b53_timer_state);
+	u64 prev = st->last[virt];
+	u64 raw = b53_read_raw(virt);
+	s64 d = raw - prev;
+	u64 cur;
+
+	if (likely(d >= 0 && d < B53_FAST_WINDOW)) {
+		cur = raw;
+		goto accept;
+	}
+
+	if (d < 0 && -d < B53_CLAMP_WINDOW) {
+		st->clamped++;
+		return prev;
+	}
+
+	st->checked++;
+	cur = b53_read_pair(virt, st);
+	if (abs((s64)(raw - cur)) >= B53_CLAMP_WINDOW)
+		st->rejected++;
+
+	d = cur - prev;
+	if (d < 0) {
+		if (-d < B53_CLAMP_WINDOW) {
+			st->clamped++;
+			return prev;
+		}
+		st->resynced++;
+	}
+accept:
+	st->last[virt] = cur;
+	return cur;
+}
 
 static u64 notrace b53_read_cntpct_el0(void)
 {
-	u64 cur = read_sysreg(cntpct_el0);
-	u64 prev = __this_cpu_read(b53_last_cntpct);
-
-	if (unlikely(!prev)) {
-		__this_cpu_write(b53_last_cntpct, cur);
-		return cur;
-	}
-
-	/* 1. Negative ripple drop (< 12.5ms): clamp to prev for strict monotonicity */
-	if (unlikely(cur < prev)) {
-		if (likely(prev - cur < B53_RIPPLE_DROP_THRESHOLD))
-			return prev;
-		/* Legitimate rollover or massive jump recovery */
-		__this_cpu_write(b53_last_cntpct, cur);
-		return cur;
-	}
-
-	/* 2. Large forward jump (> 1ms): verify against transient positive carry spike */
-	if (unlikely(cur - prev > B53_SPIKE_VERIFY_THRESHOLD)) {
-		isb();
-		u64 cur2 = read_sysreg(cntpct_el0);
-
-		if (unlikely(cur2 < cur && (cur - cur2 > B53_SPIKE_VERIFY_THRESHOLD / 2))) {
-			if (cur2 < prev)
-				return prev;
-			__this_cpu_write(b53_last_cntpct, cur2);
-			return cur2;
-		}
-		cur = cur2;
-	}
-
-	__this_cpu_write(b53_last_cntpct, cur);
-	return cur;
+	return b53_read_counter(false);
 }
 
 static u64 notrace b53_read_cntvct_el0(void)
 {
-	u64 cur = read_sysreg(cntvct_el0);
-	u64 prev = __this_cpu_read(b53_last_cntvct);
-
-	if (unlikely(!prev)) {
-		__this_cpu_write(b53_last_cntvct, cur);
-		return cur;
-	}
-
-	/* 1. Negative ripple drop (< 12.5ms): clamp to prev for strict monotonicity */
-	if (unlikely(cur < prev)) {
-		if (likely(prev - cur < B53_RIPPLE_DROP_THRESHOLD))
-			return prev;
-		__this_cpu_write(b53_last_cntvct, cur);
-		return cur;
-	}
-
-	/* 2. Large forward jump (> 1ms): verify against transient positive carry spike */
-	if (unlikely(cur - prev > B53_SPIKE_VERIFY_THRESHOLD)) {
-		isb();
-		u64 cur2 = read_sysreg(cntvct_el0);
-
-		if (unlikely(cur2 < cur && (cur - cur2 > B53_SPIKE_VERIFY_THRESHOLD / 2))) {
-			if (cur2 < prev)
-				return prev;
-			__this_cpu_write(b53_last_cntvct, cur2);
-			return cur2;
-		}
-		cur = cur2;
-	}
-
-	__this_cpu_write(b53_last_cntvct, cur);
-	return cur;
+	return b53_read_counter(true);
 }
+
+static int b53_timer_proc_show(struct seq_file *m, void *v)
+{
+	int cpu;
+
+	seq_puts(m, "cpu    clamped    checked   rejected   resynced   unstable\n");
+	for_each_online_cpu(cpu) {
+		struct b53_timer_state *st = per_cpu_ptr(&b53_timer_state, cpu);
+
+		seq_printf(m, "%3d %10lu %10lu %10lu %10lu %10lu\n", cpu,
+			   st->clamped, st->checked, st->rejected,
+			   st->resynced, st->unstable);
+	}
+	return 0;
+}
+
+static int __init b53_timer_proc_init(void)
+{
+	if ((read_cpuid_id() & MIDR_CPU_MODEL_MASK) == MIDR_BRAHMA_B53)
+		proc_create_single("b53_timer", 0444, NULL, b53_timer_proc_show);
+	return 0;
+}
+late_initcall(b53_timer_proc_init);
 
 #ifdef CONFIG_SUN50I_ERRATUM_UNKNOWN1
 /*
