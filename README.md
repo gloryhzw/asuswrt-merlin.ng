@@ -52,7 +52,33 @@ Reads of the 80 MHz architectural system counter (`cntpct_el0` / `cntvct_el0`) o
 - **Mostly backward, but not always.** Almost every offset reads low. One forward offset of +2,026 ticks has been seen.
 - **One momentary error of 1 ms or more** (`rejected = 1`). It vanished on the next read, so the pair check dropped it.
 - **The view gains time.** Compared with the Broadcom peripheral timer, the arch counter view gains ~250–300 ppm in small forward steps of 25–90 µs that never come back. The kernel measured up to ~900 ppm in the first minutes after boot. The peripheral timer itself tracks NTP time within ~30 ppm.
-- The suspected mechanism is a counter whose carry ripples into the upper bits slowly enough to be read half-done. This is a hypothesis consistent with the data, not a confirmed silicon description.
+
+#### Root cause: carries that do not complete (captured bit by bit)
+A test module (`b53_jump.ko`) read the raw counter in a tight loop on one CPU, bypassing the kernel filter, for one hour with about 45% coverage. It saved the exact values around every step of 2^15 ticks or more and compared each one with the peripheral reference timer.
+
+**Every captured event happened at a carry**, i.e. when adding 1 had to flip many bits at once (`0x…ffff → 0x…0000`, 12 to 23 bits in the captures). In each case the counter ended up with a mix of old and new bits. There are three outcomes:
+
+| Outcome | What the bits show | Error | Example (carry into bit) |
+|---|---|---|---|
+| **Stale lower bits** (most common) | bit k sets, but some lower bits keep their old 1s | forward, up to +2^k ("2^k minus a little") | `…c1fffe → …c3dc16`, +121,880 (17); `…4b7ffffe → …4ba000ba`, +2,097,340 = 2^21 + 188 (23) |
+| **Lost carry** | the lower bits clear, but bit k never sets | backward, −2^k | `…3efffe → …3e00ba`, −65,348 = −2^16 + 188 (16) |
+| **Torn read only** | one read is torn, the next read is correct | heals at once | `…bfffe → …c7fff → …c0007`, +32,769 (18) |
+
+In the first two cases **the counter keeps counting normally from the wrong value**: every later read is consistent, and the window ends off from the reference by the full amount. So the error is a new starting point, not a bad read, and it never undoes itself.
+
+Totals for the hour:
+- **17 captured events**: 10 permanent (8 forward, 2 backward) and 7 read-only tears, the largest −360,611 ticks (−4.5 ms) at a carry through 21 bits;
+- 94 more windows with a net error of 4,096 ticks or more against the reference (smaller permanent steps, below the capture threshold);
+- ~53,000 steps of 64–32,767 ticks.
+
+**The failures repeat exactly.** Events 4 and 15, almost an hour apart, were both carries into bit 17 and both ended with the low 18 bits at exactly `0x3dc16` (+121,880 ticks, the same to the tick). Four other permanent events (carries into bits 16, 18 and 23, both directions) all ended with low bits `0x…0ba`. The bits are 0x0ba = 186 ticks (2.3 µs) past the carry, as if the bad value is always stored at the same moment after the carry starts. So the failure looks like a fixed logic or timing flaw in specific bits, not random electrical noise.
+
+What follows from this:
+- **The jump size is the value of the stale bit(s).** The forward steps of the ~300 ppm gain are failed carries into bits 11–14, and the 2^17–2^29 corrections in the soak (section 4) are the same failure in higher bits.
+- **Any bit can fail.** Large jumps are rare only because a carry into bit k happens once every 2^k ticks. Up to 2^29 (+6.66 s) has been seen, and nothing in the data rules out higher bits.
+- **The fault is in the counter shared by all cores**, which is why every CPU sees the same jump.
+
+Still unknown: why some torn values stick while others only affect one read, and the physical cause inside the chip (probably a timing or clock-domain problem in the counter logic, which only Broadcom could confirm).
 
 #### Why a tiny glitch reboots the router
 Linux assumes the counter never goes backwards. A drop of even 1 tick produces a huge unsigned delta in code that does `(now - last) & mask`:
@@ -62,11 +88,17 @@ Linux assumes the counter never goes backwards. A drop of even 1 tick produces a
 
 The end result observed in crash logs was CPU 0 stalling, `wdtd` not petting `/dev/watchdog`, and a hardware watchdog reset (`BOOT REASON WATCHDOG 0x3424`).
 
-#### Not yet measured: large persistent offsets
-Because offsets persist, a stale carry into a higher bit (bit 20, 32 or 44, i.e. 13 ms, 53.7 s or days) would shift the whole counter view by that much. The hardware timer comparator compares against **the same shifted view**, so a large backward offset would make every CPU's timer late by that amount. Nothing would crash, but time and all timer interrupts would stop, and the watchdog would reset the board.
+#### Large permanent jumps (measured in the Kernel #23 soak)
+Because a failed carry changes the counter itself, a failure in a high bit shifts time for good. In the first 8 hours of the #23 soak (Oct 6 2026) the kernel corrected **65 jumps of 1 ms or more**:
+- most were ≈ 2^17 (1.6 ms) forward, one every 5–10 minutes;
+- several ≈ 2^18 / 2^19 forward;
+- three +2^20 and **four −2^20 (13 ms backward)**;
+- **one +2^28 (+3.34 s)**, plus a +2^29 (+6.66 s) a few hours later.
 
-- **No persistent offset of 1 ms or more has been observed** (the kernel's `fixes` count has stayed at 0 outside of tests).
-- The 0928 crash fits this picture: a watchdog pretimeout with CPU 0 idle and none of the other stall detectors firing, which is what a global timer stall would look like. It is still **unconfirmed** that large offsets cause the reboots. Kernel #23 corrects them and counts each one, so the soak test can answer this.
+How each kind of jump affects an unprotected kernel:
+- **Backward (lost carry):** time goes backwards permanently, triggering the `sched_clock` / timekeeping underflow described above. The hardware timer comparator compares against the same counter, so a large backward jump also makes every timer late by that amount.
+- **Forward:** time skips ahead, and every timer due in that interval fires at once. That is harmless up to about 25 s. From 2^31 (26.8 s) up, jiffies jump past `rcu_cpu_stall_timeout` (25 s), and with `panic_on_rcu_stall=1` (set in `init-start`) that would cause a false RCU stall panic. No jump that large has been seen yet.
+- The 0928 crash (watchdog pretimeout with CPU 0 idle and no other stall detector firing) fits a large backward jump stalling all timers. This is consistent with the data but not proven.
 - The 0.6 to 13 ms "forward glitches" reported by `test_b53_bidir` are gaps where the test thread was preempted (its threshold flags any gap over 625 µs, and no matching backward correction ever follows).
 
 ### 2. The Kernel Fixes
@@ -171,7 +203,15 @@ chmod +x /tmp/b53_bench
 
   Every offset was caught on the next read and corrected to within ~6 µs, and timers kept firing through the 60 s offset. The ~10 ms worst sleeps also occur with nothing injected (CPU contention from the 4-core read test). Each catch/undo pair leaves a few hundred ticks in `compensation` (reference read noise; 1,625 ticks ≈ 20 µs after 4 pairs).
 
-  **Status: soak test started Oct 6 2026.** Treat it as proven only after more than 7 days of uptime (well past #14's 30–78 h failure window). A non-zero `fixes` with no reboot would show both the cause and the fix.
+  **More injection tests (Oct 6 2026):**
+  - forward +2^31 (26.8 s) and +2^32 (53.7 s), each held 60 s: corrected to within ~100 ticks, no RCU stall or lockup;
+  - a sweep of ±2^33 … ±2^53 (`k23_sweep.sh`), 84 cases under 4-core load and idle: all corrected and undone, 0 backward reads in 3.1 G reads.
+
+  These tests do not cover two paths:
+  - **Heartbeat-only detection:** even with the router idle, every jump was caught by the next counter read; testing this needs a kernel test knob.
+  - **The first ~3 s after boot**, before the reference timer starts.
+
+  **Status: soak test started Oct 6 2026.** In the first 8 hours #23 corrected 65 real jumps (section 1), including +3.34 s and four −13 ms, with no backward time and no reboot. Treat it as proven only after more than 7 days of uptime (well past #14's 30–78 h failure window).
 
 ### 5. Key File Locations & Source Code Map
 
@@ -187,12 +227,17 @@ chmod +x /tmp/b53_bench
 - **Kernel config for this platform**:
   [`config_base.6a.6765`](release/src-rt-5.04behnd.4916/kernel/linux-4.19/config_base.6a.6765) — watchdog pretimeout panic governor and `CONFIG_PRINTK_TIME`. (The panic governor itself is the stock `drivers/watchdog/pretimeout_panic.c`, only enabled here.)
 
-#### B. Validation & test tools (local build host, not in this repo)
-- `/home/glory/b53_bench.c` — 7-test benchmark source; deployed on the router as `/jffs/b53_bench`.
-- `/home/glory/merlin/test_b53_bidir.c` — backward/forward glitch logger (the forward column counts preemption gaps; see section 1).
-- `/home/glory/merlin/b53_timer_test` — multi-core glitch detector; deployed as `/jffs/b53_timer_test`.
-- `/home/glory/b53_exp/b53_verify.c` — compares `CLOCK_MONOTONIC` and 1 ms sleeps against the peripheral reference timer (via `/dev/mem`); usage `b53_verify <ref_timer> <secs>`.
-- `/home/glory/b53_exp/k21_test.sh` — the #23 injection test (table in section 4); results in `k23_test.log`.
+#### B. Validation & test tools ([`tools/b53/`](tools/b53/))
+- [`b53_bench.c`](tools/b53/b53_bench.c) — 7-test benchmark; deployed on the router as `/jffs/b53_bench`.
+- [`test_b53_bidir.c`](tools/b53/test_b53_bidir.c) — backward/forward glitch logger (the forward column counts preemption gaps; see section 1).
+- `b53_timer_test` — multi-core glitch detector; deployed as `/jffs/b53_timer_test` (binary only, on the build host at `/home/glory/merlin/b53_timer_test`).
+- [`b53_verify.c`](tools/b53/b53_verify.c) — compares `CLOCK_MONOTONIC` and 1 ms sleeps against the peripheral reference timer (via `/dev/mem`); usage `b53_verify <ref_timer> <secs>`.
+- [`k21_test.sh`](tools/b53/k21_test.sh) — the #23 injection test (table in section 4).
+- [`k23_fwd_test.sh`](tools/b53/k23_fwd_test.sh) — forward injections of +2^31 and +2^32, each held 60 s.
+- [`k23_sweep.sh`](tools/b53/k23_sweep.sh) — injection sweep of ±2^33 … ±2^53, matching corrections by size.
+- [`kmod/b53_jump.c`](tools/b53/kmod/b53_jump.c) — loadable module that captures the raw counter bits around each jump (section 1); `insmod b53_jump.ko secs=3600 cpu=2 ref=2`, results in dmesg.
+- [`kmod/b53_ref.c`](tools/b53/kmod/b53_ref.c) — loadable module that times arch offsets (start to end) against a peripheral reference timer; `insmod b53_ref.ko secs=60 cpu=2`, results in dmesg, unloads itself.
+- Build the modules with `make -C tools/b53/kmod` as user `glory` after sourcing `setup_env.sh`. Test logs (`k23_*.log`, `b53_jump_run.log`) stay on the build host in `/home/glory/b53_exp/`.
 
 #### C. Build & flashing tools (local build host, not in this repo)
 - `/home/glory/merlin/setup_env.sh` — toolchain paths and the `build_be92u` helper (build as user `glory`, never root).
