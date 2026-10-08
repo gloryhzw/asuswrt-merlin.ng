@@ -71,14 +71,20 @@ Totals for the hour:
 - 94 more windows with a net error of 4,096 ticks or more against the reference (smaller permanent steps, below the capture threshold);
 - ~53,000 steps of 64–32,767 ticks.
 
-**The failures repeat exactly.** Events 4 and 15, almost an hour apart, were both carries into bit 17 and both ended with the low 18 bits at exactly `0x3dc16` (+121,880 ticks, the same to the tick). Four other permanent events (carries into bits 16, 18 and 23, both directions) all ended with low bits `0x…0ba`. The bits are 0x0ba = 186 ticks (2.3 µs) past the carry, as if the bad value is always stored at the same moment after the carry starts. So the failure looks like a fixed logic or timing flaw in specific bits, not random electrical noise.
+**The failures repeat exactly.** Events 4 and 15, almost an hour apart, were both carries into bit 17 and both ended with the low 18 bits at exactly `0x3dc16` (+121,880 ticks, the same to the tick). Four other permanent events (carries into bits 16, 18 and 23, both directions) all ended with low bits `0x…0ba`. The bits are 0x0ba = 186 ticks (2.3 µs) past the carry, as if the bad value is always stored at the same moment after the carry starts. So the failure looks like a fixed logic flaw in specific bits, not random electrical noise.
 
 What follows from this:
 - **The jump size is the value of the stale bit(s).** The forward steps of the ~300 ppm gain are failed carries into bits 11–14, and the 2^17–2^29 corrections in the soak (section 4) are the same failure in higher bits.
 - **Any bit can fail.** Large jumps are rare only because a carry into bit k happens once every 2^k ticks. Up to 2^29 (+6.66 s) has been seen, and nothing in the data rules out higher bits.
 - **The fault is in the counter shared by all cores**, which is why every CPU sees the same jump.
 
-Still unknown: why some torn values stick while others only affect one read, and the physical cause inside the chip (probably a timing or clock-domain problem in the counter logic, which only Broadcom could confirm).
+Two real events in the Kernel #23 soak show the same thing at higher bits:
+
+- **+2^32 (+53.7 s), 2026-10-07 ~04:09.** At the carry `0x747_FFFFFFFF` → `0x748_00000000`, the stored value was `0x749_00000016`. Bits 33–35 changed but bit 32 kept its old 1. This is beyond the 26.8 s RCU-stall limit; #23 fixed it 14 µs later.
+- **−24,113,417 ticks (−301 ms), 2026-10-07 ~09:00.** At a bit-25 carry, bit 25 lost its carry while bits 23 and 20 kept their old 1s: −2^25 + 2^23 + 2^20. One carry can fail in both directions at once, so sizes are not always powers of 2.
+- **−2^31 (−26.8 s), 2026-10-08 ~04:02.** At the carry `0xd89_7FFFFFFF` → `0xd89_80000000`, bits 0–30 cleared but bit 31 never received the carry: the stored value was `0xd89_00000000`. This is the size of backward jump that underflows sched_clock and stalls timers; #23 fixed it about 1.3 ms later.
+
+**Likely mechanism: a clock-domain crossing (CDC) bug.** A synchronous 56-bit counter at 80 MHz has plenty of timing margin, and static timing analysis would catch a slow carry, so the counter logic itself is unlikely to be at fault. The likely fault is where the count crosses from the system-counter clock into the B53 cluster's clock (the CPU clock, which BIUCFG varies). If the value crosses as plain binary with one synchronizer per bit, each bit settles on its own whenever many bits change at once. The receiver then latches a mix of old and new bits. Timing analysis ignores asynchronous crossings, so the tools would not flag it; Gray code or a handshake would avoid it. This fits every observation: failures only at multi-bit changes, mixed bits in both directions, the same shift on all 4 CPUs (one shared cluster copy), permanence (the copy keeps counting from what it latched), healing tears (the same race on a read-only path), and exact repeats (the crossing happens at a fixed point relative to the count). Only Broadcom could confirm it. A test that would separate the two: read the source counter over MMIO (ARM `CNTCV`, if the chip exposes it) alongside `cntvct_el0`. If the source stays clean while `cntvct_el0` jumps, the bug is in the crossing.
 
 #### Why a tiny glitch reboots the router
 Linux assumes the counter never goes backwards. A drop of even 1 tick produces a huge unsigned delta in code that does `(now - last) & mask`:
@@ -242,7 +248,7 @@ chmod +x /tmp/b53_bench
 #### C. Build & flashing tools (local build host, not in this repo)
 - `/home/glory/merlin/setup_env.sh` — toolchain paths and the `build_be92u` helper (build as user `glory`, never root).
 - `/home/glory/upload_firmware.py` — Asuswrt Login v2 Web UI firmware flasher.
-- `/home/glory/check_router_time.sh` — hourly cron check for router reboots, sending ntfy alerts; logs `/proc/b53_timer` to `~/router_b53_timer.log` and alerts on non-zero `rejected` / `bigheld` / `unstable` or a growing `fixes` count.
+- `/home/glory/check_router_time.sh` — hourly cron check for router reboots, sending ntfy alerts; logs `/proc/b53_timer` to `~/router_b53_timer.log` and alerts only on non-zero `bigheld` / `unstable` (`rejected` and a growing `fixes` count are the filter working and are only logged).
 
 #### D. Router startup scripts (persistent in `/jffs/scripts/`)
 - `/jffs/scripts/init-start` — routes the watchdog IRQ 41 and the B53 heartbeat timer IRQ (found from `/proc/b53_timer`, IRQ 38 on this unit) to CPUs 1–3 (`smp_affinity: e`), so neither depends on CPU 0; enables `printk.time=Y`.
