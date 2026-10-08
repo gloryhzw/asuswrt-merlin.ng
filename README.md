@@ -103,7 +103,7 @@ Because a failed carry changes the counter itself, a failure in a high bit shift
 
 How each kind of jump affects an unprotected kernel:
 - **Backward (lost carry):** time goes backwards permanently, triggering the `sched_clock` / timekeeping underflow described above. The hardware timer comparator compares against the same counter, so a large backward jump also makes every timer late by that amount.
-- **Forward:** time skips ahead, and every timer due in that interval fires at once. That is harmless up to about 25 s. From 2^31 (26.8 s) up, jiffies jump past `rcu_cpu_stall_timeout` (25 s), and with `panic_on_rcu_stall=1` (set in `init-start`) that would cause a false RCU stall panic. No jump that large has been seen yet.
+- **Forward:** time skips ahead, and every timer due in that interval fires at once. That is harmless up to about 25 s. From 2^31 (26.8 s) up, jiffies jump past `rcu_cpu_stall_timeout` (25 s), and with `panic_on_rcu_stall=1` (set in `init-start`) that would cause a false RCU stall panic. One real jump that large has happened since (+2^32 on 2026-10-07, see above); #23 corrected it 14 µs later.
 - The 0928 crash (watchdog pretimeout with CPU 0 idle and no other stall detector firing) fits a large backward jump stalling all timers. This is consistent with the data but not proven.
 - The 0.6 to 13 ms "forward glitches" reported by `test_b53_bidir` are gaps where the test thread was preempted (its threshold flags any gap over 625 µs, and no matching backward correction ever follows).
 
