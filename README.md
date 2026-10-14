@@ -81,7 +81,7 @@ What follows from this:
 Two real events in the Kernel #23 soak show the same thing at higher bits:
 
 - **+2^32 (+53.7 s), 2026-10-07 ~04:09.** At the carry `0x747_FFFFFFFF` → `0x748_00000000`, the stored value was `0x749_00000016`. Bits 33–35 changed but bit 32 kept its old 1. This is beyond the 26.8 s RCU-stall limit; #23 fixed it 14 µs later.
-- **−24,113,417 ticks (−301 ms), 2026-10-07 ~09:00.** At a bit-25 carry, bit 25 lost its carry while bits 23 and 20 kept their old 1s: −2^25 + 2^23 + 2^20. One carry can fail in both directions at once, so sizes are not always powers of 2.
+- **−24,113,417 ticks (−301 ms), 2026-10-07 08:25.** At a bit-25 carry, bit 25 lost its carry while bits 23 and 20 kept their old 1s: −2^25 + 2^23 + 2^20. One carry can fail in both directions at once, so sizes are not always powers of 2.
 - **−2^31 (−26.8 s), 2026-10-08 ~04:02.** At the carry `0xd89_7FFFFFFF` → `0xd89_80000000`, bits 0–30 cleared but bit 31 never received the carry: the stored value was `0xd89_00000000`. This is the size of backward jump that underflows sched_clock and stalls timers; #23 fixed it about 1.3 ms later.
 
 **Likely mechanism: a clock-domain crossing (CDC) bug.** A synchronous 56-bit counter at 80 MHz has plenty of timing margin, and static timing analysis would catch a slow carry, so the counter logic itself is unlikely to be at fault. The likely fault is where the count crosses from the system-counter clock into the B53 cluster's clock (the CPU clock, which BIUCFG varies). If the value crosses as plain binary with one synchronizer per bit, each bit settles on its own whenever many bits change at once. The receiver then latches a mix of old and new bits. Timing analysis ignores asynchronous crossings, so the tools would not flag it; Gray code or a handshake would avoid it. This fits every observation: failures only at multi-bit changes, mixed bits in both directions, the same shift on all 4 CPUs (one shared cluster copy), permanence (the copy keeps counting from what it latched), healing tears (the same race on a read-only path), and exact repeats (the crossing happens at a fixed point relative to the count). Only Broadcom could confirm it. A test that would separate the two: read the source counter over MMIO (ARM `CNTCV`, if the chip exposes it) alongside `cntvct_el0`. If the source stays clean while `cntvct_el0` jumps, the bug is in the crossing.
@@ -217,7 +217,7 @@ chmod +x /tmp/b53_bench
   - **Heartbeat-only detection:** even with the router idle, every jump was caught by the next counter read; testing this needs a kernel test knob.
   - **The first ~3 s after boot**, before the reference timer starts.
 
-  **Status: soak test started Oct 6 2026.** In the first 8 hours #23 corrected 65 real jumps (section 1), including +3.34 s and four −13 ms, with no backward time and no reboot. Treat it as proven only after more than 7 days of uptime (well past #14's 30–78 h failure window).
+  **Status: passed the 7-day soak (Oct 6–14 2026), no reboot.** Over 8 d 19 h of uptime #23 corrected 1173 real jumps (about 5.5 per hour, 1137 forward / 29 backward among the 1166 logged in detail). Six would have crashed an unprotected kernel: +3.34 s, +6.66 s, +53.7 s twice, −26.8 s and −53.7 s. No backward time was ever returned, and the net correction reached −45.0 s. Details are in the [k23 release notes](https://github.com/gloryhzw/asuswrt-merlin.ng/releases/tag/k23).
 
 ### 5. Key File Locations & Source Code Map
 
