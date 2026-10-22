@@ -93,7 +93,7 @@
                 }
 
                 // AURA RGB
-                if (lightEffectSupoort && based_modelid != "RT-BE96U") {
+                if (lightEffectSupoort) {
                     document.querySelector("#light_effect_tab").style.display = "";
                 }
 
@@ -1306,7 +1306,7 @@
                     <div class="info-block">
                         <div class="info-title"><#WLANConfig11b_AuthenticationMethod_itemname#></div>
                         <div><select id="" class="input_option" onchange=""></select></div>
-                        <!-- <span id="" style="color: #fc0"><#WLANConfig11b_AuthenticationMethod_EOT_desc#></span> -->
+                        <!-- <span id="" style="color: var(--wrt-badge-warning-color,#FFCC00)"><#WLANConfig11b_AuthenticationMethod_EOT_desc#></span> -->
                     </div>
                     <!-- <div id="" class="wpa3_hint" style="">
                         <span><#AiMesh_confirm_msg10#> <a id="" class="faq-link" target="_blank" href="">FAQ</a></span>

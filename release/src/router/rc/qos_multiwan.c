@@ -1183,7 +1183,7 @@ static int start_tqos(void)
 	for (unit = WAN_UNIT_FIRST; unit < WAN_UNIT_MAX; ++unit) {
 		snprintf(fname, sizeof(fname), "%s.%d", TMP_QOS, unit);
 		wan = get_wan_ifname(unit);
-		if (!wan || *wan == '\0')
+		if (!is_valid_ifname(wan))
 			continue;
 		snprintf(imq_if, sizeof(imq_if), "imq%d", unit);
 		if (wan_primary_ifunit() != unit
@@ -1548,6 +1548,12 @@ static int add_bandwidth_limiter_rules(char *pcWANIF)
 	while (g) {
 		if ((p = strsep(&g, "<")) == NULL) break;
 		if ((vstrsep(p, ">", &enable, &addr, &dlc, &upc, &prio)) != 5) continue;
+		/* Security: dlc/upc (DL/UL-Ceil) are written verbatim into a
+		 * root-executed tc shell script; reject empty or non-decimal
+		 * values (e.g. an embedded newline) to prevent OS command
+		 * injection via qos_bw_rulelist. */
+		if (*dlc == '\0' || !isNumber(dlc) || *upc == '\0' || !isNumber(upc))
+			continue;
 		if (!strcmp(enable, "0")) continue;
 
 		memset(addr_new, 0, sizeof(addr_new));
@@ -1688,20 +1694,20 @@ static int start_bandwidth_limiter(void)
 	if (gen_mangle)
 		add_bandwidth_limiter_rules("");
 
-	lock = file_lock(qos_lock);
-
-	if (!(f = fopen(qosfn, "w"))) {
-		ret = -1;
-		goto exit_start_bandwidth_limiter;
-	}
-
 	strlcpy(ul_ifname, get_wan_ifname(wan_primary_ifunit()), sizeof(ul_ifname));
+	if (!is_valid_ifname(ul_ifname)) return -1;
 #if defined(RTCONFIG_DUALWAN)
 	if (nvram_match("wans_mode", "lb")) {
 		snprintf(ul_ifname, sizeof(ul_ifname), "imq%d", BWLIT_IMQ_ID);
 	}
 #endif
 	wan = ul_ifname;
+	lock = file_lock(qos_lock);
+
+	if (!(f = fopen(qosfn, "w"))) {
+		ret = -1;
+		goto exit_start_bandwidth_limiter;
+	}
 
 	/* Remove qdisc of br0/WAN. Ref to stop case below. */
 	fprintf(f, "#!/bin/sh\n"
@@ -1770,6 +1776,12 @@ static int start_bandwidth_limiter(void)
 	while (g) {
 		if ((p = strsep(&g, "<")) == NULL) break;
 		if ((vstrsep(p, ">", &enable, &addr, &dlc, &upc, &prio)) != 5) continue;
+		/* Security: dlc/upc (DL/UL-Ceil) are written verbatim into a
+		 * root-executed tc shell script; reject empty or non-decimal
+		 * values (e.g. an embedded newline) to prevent OS command
+		 * injection via qos_bw_rulelist. */
+		if (*dlc == '\0' || !isNumber(dlc) || *upc == '\0' || !isNumber(upc))
+			continue;
 		if (!strcmp(enable, "0")) continue;
 
 		address_format_checker(&addr_type, addr, addr_new, sizeof(addr_new));
@@ -2214,7 +2226,7 @@ static int start_rog_qos()
 	for (unit = WAN_UNIT_FIRST; unit < WAN_UNIT_MAX; ++unit) {
 		snprintf(fname, sizeof(fname), "%s.%d", TMP_QOS, unit);
 		wan = get_wan_ifname(unit);
-		if (!wan || *wan == '\0')
+		if (!is_valid_ifname(wan))
 			continue;
 
 		if (wan_primary_ifunit() != unit
@@ -2766,23 +2778,9 @@ int start_bcm_tm(void)
 	dropalg = 4;
 #endif
 
-	wan_ifname = get_wanx_ifname(wan_primary_ifunit());
+	char wan_ifname_phy[IFNAMSIZ];
 
-#if defined(RTCONFIG_MULTISERVICE_WAN)
-	char wan_ifname_phy[IFNAMSIZ] = {0};
-
-	if (is_mswan_enabled()) {
-		char *p;
-
-		strlcpy(wan_ifname_phy, nvram_safe_get("wan_ifnames"), sizeof(wan_ifname_phy));
-		if ((p = strchr(wan_ifname_phy, ' ')) != NULL)
-			*p = '\0';
-		if (!wan_ifname_phy[0])
-			strlcpy(wan_ifname_phy, WAN_IF_ETH, sizeof(wan_ifname_phy));
-
-		wan_ifname = wan_ifname_phy;
-	}
-#endif
+	wan_ifname = get_wan_phy_ifname(wan_primary_ifunit(), wan_ifname_phy, sizeof(wan_ifname_phy));
 
 	snprintf(nvname, sizeof(nvname), "wan%d_proto", wan_primary_ifunit());
 	wan_proto = nvram_safe_get(nvname);
@@ -2871,6 +2869,21 @@ int start_bcm_tm(void)
 		"\t\torig_stop_tmctl_qos=0\n"
 		"\tfi\n"
 		"\tnvram set stop_tmctl_qos=\"$orig_stop_tmctl_qos\"\n"
+		"\t;;\n\n"
+		"stats)\n"
+		"\tif [ ! -f /tmp/qos_tm_orig_qsize ]; then\n"
+		"\t\techo \"HW AQM is not running\"\n"
+		"\t\texit 1\n"
+		"\tfi\n"
+		"\techo \"===================================================================\"\n"
+		"\techo \"port: $WANIF\"\n"
+		"\techo \"-------------------------------------------------------------------\"\n"
+		"\ttmctl getporttmparms --devtype 0 --if $WANIF\n"
+		"\ttmctl getportshaper --devtype 0 --if $WANIF\n"
+		"\techo \"--- qid 0 ---\"\n"
+		"\ttmctl getqcfg --devtype 0 --if $WANIF --qid 0\n"
+		"\ttmctl getqdropalg --devtype 0 --if $WANIF --qid 0\n"
+		"\ttmctl getqstats --devtype 0 --if $WANIF --qid 0\n"
 		"\t;;\n"
 		"*)\n"
 		"esac\n",

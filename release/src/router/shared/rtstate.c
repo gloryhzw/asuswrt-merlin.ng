@@ -369,6 +369,48 @@ char *get_wanx_ifname(int unit)
 	return wan_ifname;
 }
 
+// Get physical ethernet port of a wan unit, resolving multiservice/802.1Q virtual interfaces
+char *get_wan_phy_ifname(int unit, char *buf, size_t len)
+{
+#ifdef RTCONFIG_MULTISERVICE_WAN
+	char word[IFNAMSIZ], *next;
+	char tmp[100], prefix[sizeof("wanXXXXXXXXXX_")];
+	int i = 0;
+	int base = get_ms_base_unit(unit);
+#else
+	int base = unit;
+#endif
+
+	/* ISP/IPTV profile: wan0 is a vlan or bridge device set up on top of the WAN port */
+	if (base == WAN_UNIT_FIRST && !nvram_match("switch_wantag", "")
+	 && (nvram_get_int("switch_stb_x") > 0 || nvram_get_int("switch_wan0tagid") > 0)) {
+		strlcpy(buf, wan_if_eth(), len);
+		return buf;
+	}
+
+#ifdef RTCONFIG_MULTISERVICE_WAN
+	snprintf(prefix, sizeof(prefix), "wan%d_", base);
+
+	if (is_mswan_enabled()
+	 || (nvram_match("switch_wantag", "none") && nvram_get_int(strlcat_r(prefix, "dot1q", tmp, sizeof(tmp))))) {
+		buf[0] = '\0';
+		foreach(word, nvram_safe_get("wan_ifnames"), next) {
+			if (i++ == base) {
+				strlcpy(buf, word, len);
+				break;
+			}
+		}
+		if (!buf[0])
+			strlcpy(buf, WAN_IF_ETH, len);
+
+		return buf;
+	}
+#endif
+	strlcpy(buf, get_wanx_ifname(unit), len);
+
+	return buf;
+}
+
 // Get wan ifname of working connection
 char *get_wan_ifname(int unit)
 {
@@ -1903,16 +1945,6 @@ int is_ms_wan_unit(int wan_unit)
 	return 0;
 }
 
-int get_ms_base_unit(int wan_unit)
-{
-#ifdef RTCONFIG_MULTIWAN_IF
-	if (wan_unit > WAN_UNIT_MTWAN0_MS_BASE)
-		return ((wan_unit - WAN_UNIT_MTWAN_MS_BASE) / 10);
-	else
-#endif
-	return (wan_unit > WAN_UNIT_MULTISRV_BASE) ? ((wan_unit - WAN_UNIT_MULTISRV_BASE) / 10) : wan_unit;
-}
-
 /*
  * base_wan_unit: WAN_UNIT_FIRST, WAN_UNIT_SECOND
  * idx: 0~9
@@ -1969,3 +2001,52 @@ int get_ms_num(int wan_unit)
 	return (num);
 }
 #endif //RTCONFIG_MULTISERVICE_WAN
+#if defined(RTCONFIG_MULTISERVICE_WAN) || defined(RTCONFIG_HINET_MESH_BRIDGE)
+int get_ms_base_unit(int wan_unit)
+{
+#ifdef RTCONFIG_MULTIWAN_IF
+	if (wan_unit > WAN_UNIT_MTWAN0_MS_BASE)
+		return ((wan_unit - WAN_UNIT_MTWAN_MS_BASE) / 10);
+	else
+#endif
+	return (wan_unit > WAN_UNIT_MULTISRV_BASE) ? ((wan_unit - WAN_UNIT_MULTISRV_BASE) / 10) : wan_unit;
+}
+
+char* get_mswan_base_ifname(int wan_unit, char* buf, size_t len)
+{
+	int unit = WAN_UNIT_FIRST;
+	char wan_ifnames[64] = {0};
+	char ifname[IFNAMSIZ] = {0};
+	char *next = NULL;
+	int base_unit = get_ms_base_unit(wan_unit);
+#ifdef RTCONFIG_MULTIWAN_IF
+	int real_unit;
+	char wan_prefix[16] = {0};
+#endif
+
+	if (!buf)
+		return NULL;
+
+	memset(buf, 0, len);
+
+	nvram_safe_get_r("wan_ifnames", wan_ifnames, sizeof(wan_ifnames));
+	foreach (ifname, wan_ifnames, next)
+	{
+		if (unit == base_unit)
+		{
+			strlcpy(buf, ifname, len);
+			break;
+		}
+#ifdef RTCONFIG_MULTIWAN_IF
+		real_unit = mtwan_get_real_wan(unit + MULTI_WAN_START_IDX, wan_prefix, sizeof(wan_prefix));
+		if (real_unit == base_unit)
+		{
+			strlcpy(buf, ifname, len);
+			break;
+		}
+#endif
+		unit++;
+	}
+	return buf[0] ? buf: NULL;
+}
+#endif

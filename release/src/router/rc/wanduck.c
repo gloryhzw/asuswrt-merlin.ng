@@ -32,6 +32,16 @@ static int wdbg = 0;
 
 #define _wdbg(fmt, args...) do { if (wdbg) { dbg(fmt, ## args); }; } while (0)
 
+/* After a line switch, the DISCONN branch won't switch again for
+ * SWITCH_HOLDOFF seconds, giving the new line time to come up.
+ * uptime()-based so an NTP clock step can't affect it. */
+#define SWITCH_HOLDOFF		30
+static long last_line_switch_ts = 0;
+static long last_holdoff_log_ts = -1;
+
+#define CLIENT_IDLE_TIMEOUT	30
+static long client_accept_ts[MAX_USER];
+
 
 #if defined(RTCONFIG_WANRED_LED)
 #if defined(RTCONFIG_WANLEDX2)
@@ -667,6 +677,9 @@ int do_ping_detect(int wan_unit, const char *target)
 	char cmd[512];
 	int count, ret = -1;
 	int debug = nvram_get_int("ping_debug");
+#if defined(RTCONFIG_IPV6) && defined(RTCONFIG_USB_MODEM)
+	struct in6_addr pdp_target;
+#endif
 
 	/* can be default target, if necesary *//*
 	if (!target)
@@ -676,7 +689,9 @@ int do_ping_detect(int wan_unit, const char *target)
 	/* Check for valid domain to avoid shell escaping */
 	if (!is_valid_domainname(target)
 #if defined(RTCONFIG_IPV6) && defined(RTCONFIG_USB_MODEM)
-		&& !(dualwan_unit__usbif(wan_unit) && modem_pdp == 2)
+		&& !(dualwan_unit__usbif(wan_unit) && modem_pdp == 2
+			&& target != NULL
+			&& inet_pton(AF_INET6, target, &pdp_target) == 1)
 #endif
 			)
 		return -1;
@@ -925,7 +940,7 @@ int do_dns_detect(int wan_unit)
 		/* ret > 0: status has been read, return real status
 		 * ret = 0: child timeout or dead w/o status, return 0
 		 * ret < 0: child read error, return -1 */
-		if (ret >= sizeof(status))
+		if (ret == (int)sizeof(status))
 			ret = status;
 		else if (ret != 0)
 			ret = -1;
@@ -975,7 +990,7 @@ int do_dns_detect(int wan_unit)
 		if (p) *p = '\0';
 		if (inet_pton(AF_INET, wan_dns, &dns_server) != 1) {
 			_dprintf("dns server %s is error\n", wan_dns);
-			return -1;
+			goto dns_timeout;	// we're the forked child, must not return
 		}
 		dns_server_sock.sin_family = AF_INET;
 		dns_server_sock.sin_port = htons(53);
@@ -1089,7 +1104,7 @@ int op_resolve(char *name, struct addrinfo **res) {
 	hints.ai_socktype = SOCK_RAW;
 
 	if ((err = getaddrinfo(name, NULL, &hints, res)) != 0) {
-		fprintf(stderr, "%s\n", strerror(err));
+		fprintf(stderr, "%s\n", gai_strerror(err));
 		return -1;
 	}
 	return 0;
@@ -1124,6 +1139,7 @@ int do_backup_ping_detect(int wan_unit)
 		if (paddr)
 			break;
 	}
+	freeaddrinfo(res);
 
 	if (paddr) {
 		// add route
@@ -2513,7 +2529,11 @@ _dprintf("nat_rule: start_nat_rules 3.\n");
 		if(get_dualwan_by_unit(wan_unit) == WANS_DUALWAN_IF_USB)
 			system("/usr/sbin/modem_status.sh init_sms");
 #endif
-
+#ifdef RTCONFIG_HINET_MESH_SNOOPER
+	    /* wanduck/nt_center get wrong wanif to restart when wan is br101 of eth0, ethx, and it would cause infinite restart_wanif loops when ethX changed */
+	    if (!nvram_match("switch_wantag", "hinet_mesh"))
+#endif
+	    {
 		_dprintf("\n# wanduck(%d): Try to restart_wan_if.\n", wan_unit);
 		snprintf(cmd, sizeof(cmd), "restart_wan_if %d", wan_unit);
 		notify_rc_and_wait_2min(cmd);
@@ -2526,6 +2546,7 @@ _dprintf("nat_rule: start_nat_rules 3.\n");
 			}
 		}
 #endif
+	    }
 	}
 }
 
@@ -2572,7 +2593,7 @@ void send_page(int wan_unit, int sfd, char *file_dest, char *url){
 	char timebuf[100];
 	char dut_addr[64];
 	char dut_proto[16];
-	char dut_port[5];
+	char dut_port[6];
 	char redirection[100];
 	char indexpage[128];
 	int i=0, wl_url_hit=0;
@@ -2691,7 +2712,7 @@ void parse_dst_url(char *page_src){
 	memset(host, 0, sizeof(host));
 
 	for(i = 0; i < strlen(page_src); ++i){
-		if(i >= PATHLEN)
+		if(i >= PATHLEN-1)
 			break;
 
 		if(page_src[i] == ' ' || page_src[i] == '?'){
@@ -2703,10 +2724,12 @@ void parse_dst_url(char *page_src){
 	}
 
 	if((hp = strstr(page_src, "Host:")) != NULL){
-		hp += 6;
+		hp += 5;
+		while(*hp == ' ' || *hp == '\t')
+			hp++;
 		j = 0;
 		for(i = 0; i < strlen(hp); ++i){
-			if(i >= 64)
+			if(i >= (int)sizeof(host)-1)
 				break;
 
 			if(hp[i] == '\r' || hp[i] == '\n'){
@@ -2728,7 +2751,8 @@ void handle_http_req(int sfd, char *line){
 		parse_dst_url(line+5);
 
 		len = strlen(dst_url);
-		if((dst_url[len-4] == '.') &&
+		if((len >= 4) &&
+				(dst_url[len-4] == '.') &&
 				(dst_url[len-3] == 'i') &&
 				(dst_url[len-2] == 'c') &&
 				(dst_url[len-1] == 'o')){
@@ -2915,7 +2939,7 @@ void run_http_serv(int sockfd){
 
 	memset(line, 0, sizeof(line));
 
-	if((n = read(sockfd, line, MAXLINE)) == 0){	// client close
+	if((n = read(sockfd, line, sizeof(line) - 1)) == 0){	// client close
 		close_socket(sockfd, T_HTTP);
 
 		return;
@@ -3422,6 +3446,9 @@ int switch_wan_line(const int wan_unit, const int restart_other){
 	}
 #endif
 
+	/* Start the switch hold-off here, so the restart_other wait
+	 * for the old line doesn't eat into it */
+	last_line_switch_ts = uptime();
 	_dprintf("%s: wan(%d) End.\n", __FUNCTION__, wan_unit);
 	return 1;
 }
@@ -4240,6 +4267,7 @@ _dprintf("wanduck(%d)(fo   conn): state %d, state_old %d, changed %d, wan_state 
 				if(test_log) _dprintf("# wanduck: set S_IDLE: %s.\n", (conn_changed_state[current_wan_unit] == D2C)?"D2C":"CONNED");
 				conn_state_old[current_wan_unit] = conn_state[current_wan_unit];
 				set_disconn_count(current_wan_unit, S_IDLE);
+				last_line_switch_ts = 0;	// line is up, end switch hold-off
 			}
 			else if(conn_state[current_wan_unit] == DISCONN){
 				if(conn_state_old[current_wan_unit] == CONNED)
@@ -4417,6 +4445,7 @@ _dprintf("wanduck(%d) fail-back: state %d, state_old %d, changed %d, wan_state %
 				if(test_log) _dprintf("# wanduck: set S_IDLE: %s.\n", (conn_changed_state[current_wan_unit] == D2C)?"D2C":"CONNED");
 				conn_state_old[current_wan_unit] = conn_state[current_wan_unit];
 				set_disconn_count(current_wan_unit, S_IDLE);
+				last_line_switch_ts = 0;	// line is up, end switch hold-off
 			}
 			else if(conn_state[current_wan_unit] == DISCONN){
 				if(conn_state_old[current_wan_unit] == CONNED)
@@ -5089,12 +5118,30 @@ _dprintf("nat_rule: start_nat_rules 6.\n");
 							)
 					)
 			{
-				_dprintf("# wanduck(%d): Switching the connect to the %d WAN line...\n", current_wan_unit, get_next_unit(current_wan_unit));
-				set_disconn_count(current_wan_unit, S_IDLE);;
-				if(!link_wan[current_wan_unit] && dualwan_unit__usbif(current_wan_unit))
-					switch_wan_line(other_wan_unit, 0);
-				else
-					switch_wan_line(other_wan_unit, 1);
+				/* Hold the switch while the line we just moved to is still coming up.
+				 * The count is left as is, so a line that's really down switches as
+				 * soon as the hold ends. An unplugged USB modem is not held. */
+				long hold_now = uptime();
+				int hold = (last_line_switch_ts != 0 && hold_now - last_line_switch_ts < SWITCH_HOLDOFF);
+#ifdef RTCONFIG_USB_MODEM
+				if(dualwan_unit__usbif(current_wan_unit) && !link_wan[current_wan_unit])
+					hold = 0;
+#endif
+				if(hold){
+					if(last_holdoff_log_ts != last_line_switch_ts){
+						last_holdoff_log_ts = last_line_switch_ts;
+						logmessage("wanduck", "WAN(%d) not up yet after a line switch - holding the next switch for up to %d s", current_wan_unit, SWITCH_HOLDOFF);
+					}
+					_dprintf("# wanduck(%d): switch hold-off, %lds left.\n", current_wan_unit, SWITCH_HOLDOFF - (hold_now - last_line_switch_ts));
+				}
+				else{
+					_dprintf("# wanduck(%d): Switching the connect to the %d WAN line...\n", current_wan_unit, get_next_unit(current_wan_unit));
+					set_disconn_count(current_wan_unit, S_IDLE);;
+					if(!link_wan[current_wan_unit] && dualwan_unit__usbif(current_wan_unit))
+						switch_wan_line(other_wan_unit, 0);
+					else
+						switch_wan_line(other_wan_unit, 1);
+				}
 			}
 			else
 #endif // RTCONFIG_DUALWAN || RTCONFIG_USB_MODEM
@@ -5175,7 +5222,10 @@ if(test_log) _dprintf("nat_rule: stop_nat_rules 7.\n");
 				rule_setup = 1;
 
 				handle_wan_line(other_wan_unit, rule_setup);
-				switch_wan_line(other_wan_unit, 0);
+				/* changed_count[] of the primary was used as the fail-back counter,
+				 * start clean or the next DISCONN scan switches straight back. */
+				if(switch_wan_line(other_wan_unit, 0))
+					set_disconn_count(other_wan_unit, S_IDLE);
 			}
 			else if(conn_state[other_wan_unit] == PHY_RECONN){
 				_dprintf("\n# wanduck(fail-back): Try to prepare the backup line.\n");
@@ -5239,6 +5289,18 @@ if(test_log) _dprintf("nat_rule: stop_nat_rules 7.\n");
 		start_demand_ppp(current_wan_unit, 1);
 
 WANDUCK_SELECT:
+		/* Drop redirect clients that connected but never sent anything.
+		 * close_socket() indexes by the global fd_i, so iterate with it. */
+		{
+			long sweep_now = uptime();
+			for(fd_i = 0; fd_i <= maxi; ++fd_i){
+				if(client[fd_i].sfd >= 0 && sweep_now - client_accept_ts[fd_i] > CLIENT_IDLE_TIMEOUT){
+					FD_CLR(client[fd_i].sfd, &rset);	// already copied from allset
+					close_socket(client[fd_i].sfd, T_HTTP);
+				}
+			}
+		}
+
 		if((nready = select(maxfd+1, &rset, NULL, NULL, &tval)) <= 0)
 			continue;
 
@@ -5258,6 +5320,7 @@ WANDUCK_SELECT:
 				if(client[fd_i].sfd < 0){
 					client[fd_i].sfd = cur_sockfd;
 					client[fd_i].type = T_HTTP;
+					client_accept_ts[fd_i] = uptime();
 					break;
 				}
 			}
